@@ -1,0 +1,39 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = "1"
+epub = "2"
+ammonia = "4"
+unicode-segmentation = "1"
+wordfreq = "0.2"
+wordfreq-model = { version = "0.2", features = ["large-en"] }
+rust-stemmers = "1.2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+gline-rs = { version = "1", features = ["coreml"] }
+ort = "2.0.0-rc.9"
+orp = "0.9"
+dirs = "5"
+
