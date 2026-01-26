@@ -11,21 +11,51 @@ The desktop app is the "brain" - it does heavy NLP processing on your ebook libr
 
 ## Stack
 
-- **Framework**: Tauri 2.x (Rust backend + Svelte frontend)
+- **Framework**: Tauri 2.x (Rust backend + Svelte 5 frontend with runes)
 - **Data Source**: Calibre library (SQLite, read-only)
-- **NLP**: wordfreq, unicode-segmentation, gliner (NER)
+- **NLP**: wordfreq, rust-stemmers, symspell, gliner (NER)
+- **UI**: Claymorphism design with Motion One animations
 - **Export**: JSON (for iOS app consumption)
 
 ## Data Flow
 
 1. **Discovery**: Query Calibre's `metadata.db` for EPUB books + covers
 2. **Ingestion**: Load `.epub` → extract HTML → sanitize to text
-3. **Analysis** (background thread):
-   - Tokenize into sentences
-   - Filter proper nouns (capitalization heuristic + NER)
-   - Score words by frequency
-   - Return "hard words" + context sentences
+3. **Analysis** (runs async, emits progress events):
+   - Tokenize into sentences (unicode-segmentation)
+   - **Wordfreq filtering** (FIRST): Filter by frequency threshold (configurable, default 0.00005)
+   - **Malformed word filter**: symspell segmentation for EPUB errors (only on words NOT in dictionary)
+   - **Porter stemming**: Normalize word forms (running → run, gaieties → gaiety)
+   - **NER filtering** (LAST, only on candidates): GLiNER to remove proper nouns (names, places)
+   - Return "hard words" + ALL context sentences
 4. **Export**: JSON file with vocab data for iOS app
+
+## NLP Pipeline Details (nlp.rs)
+
+### Current Architecture
+
+```
+Text → Sentences → Words → Wordfreq Filter → Malformed Filter → Stemming → NER Filter → Results
+                           (freq < threshold)  (symspell)        (rust-stemmers) (GLiNER)
+```
+
+### Key Design Decisions
+
+1. **Wordfreq FIRST**: Fast filtering reduces candidates before expensive NER
+2. **Symspell only for unknown words**: Words in dictionary (freq > 0) are valid, never filter them
+3. **GLiNER lazy-loaded**: Model downloaded on first use (~650MB), uses CoreML on macOS
+4. **Progress callbacks**: Real-time UI updates with sample words being classified
+
+### Models (auto-downloaded to resources/)
+
+- `gliner/model.onnx` + `tokenizer.json` (~650MB) - NER model
+- `symspell/frequency_dictionary_en_82_765.txt` (~1.4MB) - Word segmentation dictionary
+
+### Known Issues / TODO
+
+- **Job cancellation**: Closing modal doesn't cancel background analysis
+- **Job queue**: Multiple analyses can run simultaneously (interleaved progress)
+- **Normalization timing**: Words like "blaster's" shown in progress before normalization
 
 ## Export Format
 
@@ -140,5 +170,38 @@ import { convertFileSrc } from '@tauri-apps/api/core';
 ## Code Standards
 
 - No `.unwrap()` - propagate errors to frontend
-- Load NLP models once at startup via `tauri::State`
+- Load NLP models once at startup via `tauri::State` and `OnceLock`
 - TypeScript strict mode in frontend
+- Svelte 5 runes: `$state`, `$effect`, `$derived`
+
+## Testing the NLP Pipeline
+
+To debug word filtering, analyze a book and check console output:
+
+```bash
+cargo tauri dev
+# Select a book, run analysis, watch stderr for:
+# - "Filtering malformed word 'X' -> 'Y'" (symspell)
+# - "Found N hard word candidates after wordfreq filtering"
+# - "Running NER on N sentences"
+# - "GLiNER found N unique entities"
+```
+
+### Common False Positives to Watch For
+
+If symspell filters valid words like "favorites", "neighboring", "traveled":
+- These ARE dictionary words (freq > 0) → should NOT be filtered
+- Fix: Check `wordfreq.word_frequency(word) > 0.0` BEFORE running symspell
+
+### Test Cases for Malformed Word Detection
+
+Should FILTER (concatenated EPUB errors):
+- "believethat's" → "believe that" ✓
+- "theendofeternity" → "the end of eternity" ✓
+- "meetshimself" → "meets himself" ✓
+
+Should KEEP (valid dictionary words):
+- "favorites" (freq > 0) ✓
+- "neighboring" (freq > 0) ✓
+- "traveled" (freq > 0) ✓
+- "indifferent" (freq > 0) ✓

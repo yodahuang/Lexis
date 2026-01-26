@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use symspell::{AsciiStringStrategy, SymSpell};
 use unicode_segmentation::UnicodeSegmentation;
 use wordfreq::WordFreq;
@@ -70,29 +71,48 @@ impl NlpPipeline {
 
     /// Check if a word looks like concatenated words (e.g., "believethat's")
     /// Returns true if the word should be filtered out as malformed
+    ///
+    /// Key insight: Only check words NOT in wordfreq dictionary.
+    /// Words like "favorites", "traveled", "neighboring" ARE valid words
+    /// and should NOT be filtered even if symspell can segment them.
     fn is_malformed_word(&self, word: &str) -> bool {
-        // Skip short words - they can't be concatenations
-        if word.len() < 8 {
+        // Skip short words - they can't be meaningful concatenations
+        if word.len() < 10 {
             return false;
         }
 
-        // Try symspell word segmentation first
-        if let Some(symspell) = get_symspell() {
-            // Handle words with apostrophes by checking the part before
-            let check_word = if let Some(pos) = word.find('\'') {
-                &word[..pos]
-            } else {
-                word
-            };
+        // Handle words with apostrophes by checking the part before
+        let check_word = if let Some(pos) = word.find('\'') {
+            &word[..pos]
+        } else {
+            word
+        };
 
-            if check_word.len() >= 6 {
+        // CRITICAL: If the word (or its base) is in the dictionary, it's valid!
+        // This prevents filtering real words like "favorites", "neighboring", "traveled"
+        if self.wordfreq.word_frequency(check_word) > 0.0 {
+            return false;
+        }
+
+        // Also check stemmed form
+        let stemmed = self.stem(check_word);
+        if self.wordfreq.word_frequency(&stemmed) > 0.0 {
+            return false;
+        }
+
+        // Only for words NOT in dictionary: try symspell segmentation
+        if let Some(symspell) = get_symspell() {
+            if check_word.len() >= 8 {
                 let segmentation = symspell.word_segmentation(check_word, 2);
                 let segments: Vec<&str> = segmentation.segmented_string.split_whitespace().collect();
 
-                // If segmentation found multiple words, it's likely concatenated
+                // If segmentation found multiple words, check if it makes sense
                 if segments.len() >= 2 {
-                    // Verify all segments are reasonable (at least 2 chars each)
-                    let all_valid = segments.iter().all(|s| s.len() >= 2);
+                    // All segments must be at least 3 chars and be real words
+                    let all_valid = segments.iter().all(|s| {
+                        s.len() >= 3 && self.wordfreq.word_frequency(s) > 0.0
+                    });
+
                     if all_valid {
                         eprintln!("Filtering malformed word '{}' -> '{}'", word, segmentation.segmented_string);
                         return true;
@@ -101,16 +121,13 @@ impl NlpPipeline {
             }
         }
 
-        // Fallback: heuristic check for common patterns
-        let common_suffixes = [
-            "that's", "that", "the", "this", "they", "there", "their",
-            "have", "has", "had", "been", "being", "were", "was", "will",
-        ];
+        // Fallback: heuristic for obvious concatenations with common words
+        let common_suffixes = ["that's", "that", "the", "this", "they"];
 
         for suffix in &common_suffixes {
-            if word.ends_with(suffix) && word.len() > suffix.len() + 3 {
+            if word.ends_with(suffix) && word.len() > suffix.len() + 4 {
                 let prefix = &word[..word.len() - suffix.len()];
-                if self.wordfreq.word_frequency(prefix) > 0.0 {
+                if prefix.len() >= 4 && self.wordfreq.word_frequency(prefix) > 0.0 {
                     eprintln!("Filtering malformed word '{}' (heuristic: '{}' + '{}')", word, prefix, suffix);
                     return true;
                 }
@@ -532,6 +549,253 @@ impl NlpPipeline {
         };
 
         (scored_words, stats)
+    }
+
+    /// Analyze text with cancellation support
+    /// Returns None if cancelled, Some((words, stats)) otherwise
+    pub fn analyze_with_cancel<F>(
+        &self,
+        text: &str,
+        frequency_threshold: f32,
+        cancel_token: &Arc<AtomicBool>,
+        mut on_progress: F,
+    ) -> Option<(Vec<HardWord>, AnalysisStats)>
+    where
+        F: FnMut(AnalysisProgress),
+    {
+        // Check cancellation at key points
+        macro_rules! check_cancel {
+            () => {
+                if cancel_token.load(Ordering::SeqCst) {
+                    eprintln!("Analysis cancelled");
+                    return None;
+                }
+            };
+        }
+
+        let sentences: Vec<&str> = text
+            .split(|c| c == '.' || c == '!' || c == '?')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        check_cancel!();
+
+        on_progress(AnalysisProgress {
+            stage: "Analyzing text".to_string(),
+            progress: 20,
+            detail: Some(format!("{} sentences", sentences.len())),
+            sample_words: None,
+        });
+
+        eprintln!("Processing {} sentences...", sentences.len());
+
+        let mut word_data: HashMap<String, (usize, Vec<String>, bool, HashSet<String>)> = HashMap::new();
+
+        for (i, sentence) in sentences.iter().enumerate() {
+            // Check cancellation every 100 sentences
+            if i % 100 == 0 {
+                check_cancel!();
+            }
+
+            let words: Vec<&str> = sentence.unicode_words().collect();
+            for word in &words {
+                if word.len() < 3 || word.chars().any(|c| c.is_numeric()) {
+                    continue;
+                }
+                let lower = word.to_lowercase();
+                let stemmed = self.stem(&lower);
+                let is_proper = is_likely_proper_noun(word, sentence);
+
+                let entry = word_data.entry(stemmed.clone()).or_insert_with(|| {
+                    (0, Vec::new(), false, HashSet::new())
+                });
+                entry.0 += 1;
+                if entry.1.len() < 10 {
+                    entry.1.push(sentence.to_string());
+                }
+                if is_proper {
+                    entry.2 = true;
+                }
+                entry.3.insert(lower);
+            }
+        }
+
+        check_cancel!();
+
+        // Filter candidates using wordfreq
+        let candidates: Vec<(String, usize, Vec<String>, bool, HashSet<String>)> = word_data
+            .into_iter()
+            .filter_map(|(stemmed, (count, contexts, needs_ner, original_forms))| {
+                for form in &original_forms {
+                    if self.is_malformed_word(form) {
+                        return None;
+                    }
+                }
+
+                let mut freq = self.wordfreq.word_frequency(&stemmed);
+                if freq == 0.0 {
+                    for original in &original_forms {
+                        let orig_freq = self.wordfreq.word_frequency(original);
+                        if orig_freq > freq {
+                            freq = orig_freq;
+                        }
+                    }
+                }
+
+                if freq > frequency_threshold || freq == 0.0 {
+                    return None;
+                }
+
+                Some((stemmed, count, contexts, needs_ner, original_forms))
+            })
+            .collect();
+
+        check_cancel!();
+
+        let total_candidates = candidates.len();
+        eprintln!("Found {} hard word candidates after wordfreq filtering", total_candidates);
+
+        on_progress(AnalysisProgress {
+            stage: "Filtering names & places".to_string(),
+            progress: 40,
+            detail: Some(format!("{} candidates to check", total_candidates)),
+            sample_words: None,
+        });
+
+        // NER filtering (simplified for cancellation support)
+        let proper_noun_candidates: Vec<&(String, usize, Vec<String>, bool, HashSet<String>)> =
+            candidates.iter().filter(|(_, _, _, needs_ner, _)| *needs_ner).collect();
+
+        check_cancel!();
+
+        let named_entities = if !proper_noun_candidates.is_empty() && Self::is_gliner_available() {
+            let sentences_to_check: Vec<&str> = proper_noun_candidates
+                .iter()
+                .flat_map(|(_, _, contexts, _, _)| contexts.iter().map(|s| s.as_str()))
+                .collect();
+
+            // Simplified NER with cancellation checks
+            let mut entities = HashSet::new();
+            if let Some(gliner) = self.get_gliner() {
+                let chunks: Vec<&str> = sentences_to_check.iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && s.len() < 512)
+                    .collect();
+
+                let batch_size = 16;
+                for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
+                    if batch_idx % 5 == 0 {
+                        check_cancel!();
+                    }
+
+                    let input = match TextInput::from_str(
+                        batch,
+                        &["person", "location", "organization", "country", "city"],
+                    ) {
+                        Ok(input) => input,
+                        Err(_) => continue,
+                    };
+
+                    if let Ok(output) = gliner.inference(input) {
+                        for spans in output.spans.iter() {
+                            for span in spans.iter() {
+                                let entity_text = span.text().to_lowercase();
+                                entities.insert(entity_text.clone());
+                                for word in entity_text.split_whitespace() {
+                                    entities.insert(word.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            entities
+        } else {
+            HashSet::new()
+        };
+
+        check_cancel!();
+
+        let mut filtered_by_ner: Vec<String> = Vec::new();
+
+        let mut scored_words: Vec<HardWord> = candidates
+            .into_iter()
+            .filter_map(|(stemmed, count, contexts, needs_ner, original_forms)| {
+                if needs_ner {
+                    if named_entities.contains(&stemmed) {
+                        filtered_by_ner.push(stemmed.clone());
+                        return None;
+                    }
+                    for original in &original_forms {
+                        if named_entities.contains(original) {
+                            filtered_by_ner.push(original.clone());
+                            return None;
+                        }
+                    }
+                }
+
+                let mut best_form: Option<(String, f32)> = None;
+                for form in &original_forms {
+                    let freq = self.wordfreq.word_frequency(form);
+                    if freq > 0.0 {
+                        if best_form.is_none() || form.len() < best_form.as_ref().unwrap().0.len() {
+                            best_form = Some((form.clone(), freq));
+                        }
+                    }
+                }
+                let (display_word, freq) = best_form.unwrap_or_else(|| {
+                    let shortest = original_forms.iter()
+                        .min_by_key(|s| s.len())
+                        .cloned()
+                        .unwrap_or(stemmed.clone());
+                    let freq = self.wordfreq.word_frequency(&stemmed);
+                    (shortest, freq)
+                });
+
+                let clean_contexts: Vec<String> = contexts.iter()
+                    .map(|ctx| {
+                        ctx.replace("&nbsp;", " ")
+                           .replace('\u{00A0}', " ")
+                           .split_whitespace()
+                           .collect::<Vec<_>>()
+                           .join(" ")
+                    })
+                    .collect();
+
+                let mut variants: Vec<String> = original_forms.into_iter()
+                    .filter(|f| f != &display_word)
+                    .collect();
+                variants.sort();
+
+                Some(HardWord {
+                    word: display_word,
+                    frequency_score: freq as f64,
+                    contexts: clean_contexts,
+                    count,
+                    variants,
+                })
+            })
+            .collect();
+
+        scored_words.sort_by(|a, b| {
+            a.frequency_score.partial_cmp(&b.frequency_score).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        on_progress(AnalysisProgress {
+            stage: "Complete".to_string(),
+            progress: 100,
+            detail: Some(format!("{} hard words found", scored_words.len())),
+            sample_words: None,
+        });
+
+        let stats = AnalysisStats {
+            total_candidates,
+            filtered_by_ner,
+            hard_words_count: scored_words.len(),
+        };
+
+        Some((scored_words, stats))
     }
 }
 

@@ -2,12 +2,16 @@ mod calibre;
 mod epub;
 mod nlp;
 
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 
 pub struct AppState {
     pub library_path: Mutex<Option<String>>,
     pub nlp: nlp::NlpPipeline,
+    /// Active analysis jobs: book_id -> cancellation token
+    pub active_jobs: Mutex<HashMap<i64, Arc<AtomicBool>>>,
 }
 
 impl Default for AppState {
@@ -15,6 +19,7 @@ impl Default for AppState {
         Self {
             library_path: Mutex::new(None),
             nlp: nlp::NlpPipeline::new(),
+            active_jobs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -87,7 +92,19 @@ async fn analyze_book(
     window: tauri::Window,
     state: tauri::State<'_, AppState>,
 ) -> Result<AnalysisResult, String> {
-    let threshold = frequency_threshold.unwrap_or(0.00005); // Default: rarer words only
+    let threshold = frequency_threshold.unwrap_or(0.00005);
+
+    // Create cancellation token and register the job
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    {
+        let mut jobs = state.active_jobs.lock().unwrap();
+        // Cancel any existing job for this book
+        if let Some(old_token) = jobs.get(&book_id) {
+            old_token.store(true, Ordering::SeqCst);
+        }
+        jobs.insert(book_id, Arc::clone(&cancel_token));
+    }
+
     let lib_path = {
         let guard = state.library_path.lock().unwrap();
         guard.clone().ok_or("No library loaded")?
@@ -97,7 +114,12 @@ async fn analyze_book(
         .map_err(|e| e.to_string())?
         .ok_or("No EPUB file found for this book")?;
 
-    // Emit progress: extracting text
+    // Check cancellation before expensive operation
+    if cancel_token.load(Ordering::SeqCst) {
+        cleanup_job(&state, book_id);
+        return Err("Analysis cancelled".to_string());
+    }
+
     let _ = window.emit("analysis-progress", AnalysisProgress {
         book_id,
         stage: "Extracting text".to_string(),
@@ -109,10 +131,17 @@ async fn analyze_book(
     let extracted = epub::extract_text(&epub_path).map_err(|e| e.to_string())?;
     let word_count = extracted.full_text.split_whitespace().count();
 
-    // Run NLP analysis with progress callback
+    // Check cancellation before NLP
+    if cancel_token.load(Ordering::SeqCst) {
+        cleanup_job(&state, book_id);
+        return Err("Analysis cancelled".to_string());
+    }
+
+    // Run NLP analysis with progress callback and cancellation check
     let nlp = &state.nlp;
     let window_clone = window.clone();
-    let (hard_words, stats) = nlp.analyze(&extracted.full_text, threshold, |progress| {
+    let cancel_clone = Arc::clone(&cancel_token);
+    let result = nlp.analyze_with_cancel(&extracted.full_text, threshold, &cancel_clone, |progress| {
         let _ = window_clone.emit("analysis-progress", AnalysisProgress {
             book_id,
             stage: progress.stage,
@@ -122,7 +151,11 @@ async fn analyze_book(
         });
     });
 
-    // Emit progress: complete
+    // Clean up job tracking
+    cleanup_job(&state, book_id);
+
+    let (hard_words, stats) = result.ok_or("Analysis cancelled")?;
+
     let _ = window.emit("analysis-progress", AnalysisProgress {
         book_id,
         stage: "Analysis complete!".to_string(),
@@ -139,6 +172,29 @@ async fn analyze_book(
     })
 }
 
+fn cleanup_job(state: &tauri::State<'_, AppState>, book_id: i64) {
+    let mut jobs = state.active_jobs.lock().unwrap();
+    jobs.remove(&book_id);
+}
+
+#[tauri::command]
+fn cancel_analysis(book_id: i64, state: tauri::State<'_, AppState>) -> bool {
+    let jobs = state.active_jobs.lock().unwrap();
+    if let Some(token) = jobs.get(&book_id) {
+        token.store(true, Ordering::SeqCst);
+        eprintln!("Cancelling analysis for book {}", book_id);
+        true
+    } else {
+        false
+    }
+}
+
+#[tauri::command]
+fn get_active_jobs(state: tauri::State<'_, AppState>) -> Vec<i64> {
+    let jobs = state.active_jobs.lock().unwrap();
+    jobs.keys().cloned().collect()
+}
+
 #[tauri::command]
 fn export_json(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
@@ -150,7 +206,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![scan_library, get_epub_path, get_book_text, analyze_book, export_json])
+        .invoke_handler(tauri::generate_handler![scan_library, get_epub_path, get_book_text, analyze_book, export_json, cancel_analysis, get_active_jobs])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

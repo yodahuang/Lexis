@@ -188,17 +188,40 @@
       analysisResult = result;
       exportedBooks.set(book.id, result);
     } catch (e) {
-      analysisError = String(e);
+      const errorMsg = String(e);
+      // Don't show error for cancelled analysis
+      if (!errorMsg.includes("cancelled")) {
+        analysisError = errorMsg;
+      }
     } finally {
       analyzing = false;
       analysisProgress = null;
     }
   }
 
+  async function cancelAnalysis() {
+    if (selectedBook) {
+      await invoke("cancel_analysis", { bookId: selectedBook.id });
+      analyzing = false;
+      analysisProgress = null;
+    }
+  }
+
   function closeModal() {
+    // Cancel any running analysis when closing
+    if (analyzing && selectedBook) {
+      invoke("cancel_analysis", { bookId: selectedBook.id });
+    }
     selectedBook = null;
     analysisResult = null;
     analysisError = null;
+    analyzing = false;
+    analysisProgress = null;
+  }
+
+  function minimizeModal() {
+    // Hide modal but keep analysis running in background
+    selectedBook = null;
   }
 
   async function exportToJson() {
@@ -375,6 +398,15 @@
             {/if}
 
             <p class="hint">This may take a moment for longer books</p>
+
+            <div class="analysis-controls">
+              <button class="clay-btn cancel-btn" onclick={cancelAnalysis}>
+                Cancel
+              </button>
+              <button class="clay-btn minimize-btn" onclick={minimizeModal}>
+                Minimize (keep running)
+              </button>
+            </div>
           </div>
         {:else if analysisError}
           <div class="clay-card error-card">
@@ -1047,6 +1079,32 @@
     .hint {
       color: var(--text-muted-dark);
     }
+  }
+
+  /* Analysis Controls */
+  .analysis-controls {
+    display: flex;
+    gap: 1rem;
+    justify-content: center;
+    margin-top: 1.5rem;
+  }
+
+  .cancel-btn {
+    background: linear-gradient(145deg, #ef4444, #dc2626);
+    color: white;
+  }
+
+  .cancel-btn:hover {
+    background: linear-gradient(145deg, #dc2626, #b91c1c);
+  }
+
+  .minimize-btn {
+    background: linear-gradient(145deg, #6b7280, #4b5563);
+    color: white;
+  }
+
+  .minimize-btn:hover {
+    background: linear-gradient(145deg, #4b5563, #374151);
   }
 
   /* Classifier Animation */
