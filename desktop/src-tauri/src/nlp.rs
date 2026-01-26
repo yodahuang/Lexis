@@ -18,6 +18,21 @@ pub struct HardWord {
     pub frequency_score: f64,
     pub contexts: Vec<String>,
     pub count: usize,
+    pub variants: Vec<String>, // All forms found (gaiety, gaieties, etc.)
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AnalysisProgress {
+    pub stage: String,
+    pub progress: u8,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct AnalysisStats {
+    pub total_candidates: usize,
+    pub filtered_by_ner: Vec<String>,
+    pub hard_words_count: usize,
 }
 
 static GLINER_MODEL: OnceLock<Option<GLiNER<SpanMode>>> = OnceLock::new();
@@ -86,7 +101,14 @@ impl NlpPipeline {
     }
 
     /// Extract entities from a limited set of sentences (for filtering hard words)
-    fn extract_entities_from_sentences(&self, sentences: &[&str]) -> HashSet<String> {
+    fn extract_entities_from_sentences<F>(
+        &self,
+        sentences: &[&str],
+        mut on_progress: F,
+    ) -> HashSet<String>
+    where
+        F: FnMut(usize, usize, usize), // (sentences_processed, total_sentences, entities_found)
+    {
         let mut entities = HashSet::new();
 
         let Some(gliner) = self.get_gliner() else {
@@ -108,18 +130,22 @@ impl NlpPipeline {
             return entities;
         }
 
-        eprintln!("Running GLiNER on {} sentences...", chunks.len());
+        let total_sentences = chunks.len();
+        eprintln!("Running GLiNER on {} sentences...", total_sentences);
 
         // Process in smaller batches for better CoreML utilization
-        let batch_size = 32;
-        for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
+        let batch_size = 16;
+        let mut processed = 0;
+
+        for batch in chunks.chunks(batch_size) {
             let input = match TextInput::from_str(
                 batch,
                 &["person", "location", "organization", "country", "city"],
             ) {
                 Ok(input) => input,
                 Err(e) => {
-                    eprintln!("Failed to create GLiNER input for batch {}: {}", batch_idx, e);
+                    eprintln!("Failed to create GLiNER input: {}", e);
+                    processed += batch.len();
                     continue;
                 }
             };
@@ -138,22 +164,35 @@ impl NlpPipeline {
                     }
                 }
                 Err(e) => {
-                    eprintln!("GLiNER inference error on batch {}: {}", batch_idx, e);
+                    eprintln!("GLiNER inference error: {}", e);
                 }
             }
+
+            processed += batch.len();
+            // Report progress after processing each batch
+            on_progress(processed, total_sentences, entities.len());
         }
 
         eprintln!("GLiNER found {} unique entities", entities.len());
         entities
     }
 
-    pub fn analyze(&self, text: &str) -> Vec<HardWord> {
+    pub fn analyze<F>(&self, text: &str, mut on_progress: F) -> (Vec<HardWord>, AnalysisStats)
+    where
+        F: FnMut(AnalysisProgress),
+    {
         // Split into sentences for context
         let sentences: Vec<&str> = text
             .split(|c| c == '.' || c == '!' || c == '?')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
+
+        on_progress(AnalysisProgress {
+            stage: "Analyzing text".to_string(),
+            progress: 20,
+            detail: Some(format!("{} sentences", sentences.len())),
+        });
 
         eprintln!("Processing {} sentences...", sentences.len());
 
@@ -239,18 +278,41 @@ impl NlpPipeline {
             })
             .collect::<HashSet<_>>()
             .into_iter()
-            .take(100) // Limit to 100 unique sentences for NER
             .collect();
 
+        let total_candidates = candidates.len();
         let named_entities = if !sentences_needing_ner.is_empty() {
-            eprintln!("Running NER on {} sentences containing proper noun candidates...", sentences_needing_ner.len());
-            self.extract_entities_from_sentences(&sentences_needing_ner)
+            let total_ner_sentences = sentences_needing_ner.len();
+            eprintln!("Running NER on {} sentences containing proper noun candidates...", total_ner_sentences);
+
+            on_progress(AnalysisProgress {
+                stage: "Filtering names & places".to_string(),
+                progress: 40,
+                detail: Some(format!("0/{} sentences", total_ner_sentences)),
+            });
+
+            self.extract_entities_from_sentences(&sentences_needing_ner, |processed, total, found| {
+                let ner_progress = 40 + (processed * 40 / total.max(1)) as u8;
+                on_progress(AnalysisProgress {
+                    stage: "Filtering names & places".to_string(),
+                    progress: ner_progress.min(80),
+                    detail: Some(format!("{}/{} sentences, {} names found", processed, total, found)),
+                });
+            })
         } else {
             eprintln!("No proper noun candidates need NER verification");
+            on_progress(AnalysisProgress {
+                stage: "Filtering names & places".to_string(),
+                progress: 80,
+                detail: Some("No NER needed".to_string()),
+            });
             HashSet::new()
         };
 
         eprintln!("Found {} named entities to filter", named_entities.len());
+
+        // Track filtered words
+        let mut filtered_by_ner: Vec<String> = Vec::new();
 
         // Final filtering and scoring
         let mut scored_words: Vec<HardWord> = candidates
@@ -259,29 +321,63 @@ impl NlpPipeline {
                 // If it was flagged as needing NER and any form is a named entity, skip it
                 if needs_ner {
                     if named_entities.contains(&stemmed) {
+                        filtered_by_ner.push(stemmed.clone());
                         return None;
                     }
                     for original in &original_forms {
                         if named_entities.contains(original) {
+                            filtered_by_ner.push(original.clone());
                             return None;
                         }
                     }
                 }
 
-                // Pick the most common original form for display
-                let display_word = original_forms.into_iter().next().unwrap_or(stemmed.clone());
-
-                // Get frequency for scoring
-                let mut freq = self.wordfreq.word_frequency(&stemmed);
-                if freq == 0.0 {
-                    freq = self.wordfreq.word_frequency(&display_word);
+                // Pick the best original form for display:
+                // 1. Prefer forms that exist in wordfreq dictionary
+                // 2. Among those, prefer the shortest (likely base form)
+                // 3. Fall back to shortest original form
+                let mut best_form: Option<(String, f32)> = None;
+                for form in &original_forms {
+                    let freq = self.wordfreq.word_frequency(form);
+                    if freq > 0.0 {
+                        if best_form.is_none() || form.len() < best_form.as_ref().unwrap().0.len() {
+                            best_form = Some((form.clone(), freq));
+                        }
+                    }
                 }
+                let (display_word, freq) = best_form.unwrap_or_else(|| {
+                    // No form in dictionary, pick shortest
+                    let shortest = original_forms.iter()
+                        .min_by_key(|s| s.len())
+                        .cloned()
+                        .unwrap_or(stemmed.clone());
+                    let freq = self.wordfreq.word_frequency(&stemmed);
+                    (shortest, freq)
+                });
+
+                // Clean up contexts: remove &nbsp; and highlight the word
+                let clean_contexts: Vec<String> = contexts.iter()
+                    .map(|ctx| {
+                        ctx.replace("&nbsp;", " ")
+                           .replace('\u{00A0}', " ") // non-breaking space
+                           .split_whitespace()
+                           .collect::<Vec<_>>()
+                           .join(" ")
+                    })
+                    .collect();
+
+                // Collect variants (other forms found)
+                let mut variants: Vec<String> = original_forms.into_iter()
+                    .filter(|f| f != &display_word)
+                    .collect();
+                variants.sort();
 
                 Some(HardWord {
                     word: display_word,
                     frequency_score: freq as f64,
-                    contexts,
+                    contexts: clean_contexts,
                     count,
+                    variants,
                 })
             })
             .collect();
@@ -293,8 +389,21 @@ impl NlpPipeline {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        eprintln!("Final result: {} hard words", scored_words.len());
-        scored_words
+        on_progress(AnalysisProgress {
+            stage: "Complete".to_string(),
+            progress: 100,
+            detail: Some(format!("{} hard words found", scored_words.len())),
+        });
+
+        eprintln!("Final result: {} hard words, {} filtered by NER", scored_words.len(), filtered_by_ner.len());
+
+        let stats = AnalysisStats {
+            total_candidates,
+            filtered_by_ner,
+            hard_words_count: scored_words.len(),
+        };
+
+        (scored_words, stats)
     }
 }
 

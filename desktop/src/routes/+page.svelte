@@ -20,13 +20,35 @@
     frequency_score: number;
     contexts: string[];
     count: number;
+    variants: string[];
+  }
+
+  interface AnalysisStats {
+    total_candidates: number;
+    filtered_by_ner: string[];
+    hard_words_count: number;
   }
 
   interface AnalysisResult {
     book_id: number;
     word_count: number;
     hard_words: HardWord[];
+    stats: AnalysisStats;
   }
+
+  // Highlight word in context
+  function highlightWord(context: string, word: string, variants: string[]): string {
+    const allForms = [word, ...variants];
+    let result = context;
+    for (const form of allForms) {
+      const regex = new RegExp(`\\b(${form})\\b`, 'gi');
+      result = result.replace(regex, '<mark>$1</mark>');
+    }
+    return result;
+  }
+
+  // Show filtered words toggle
+  let showFiltered = $state(false);
 
   let books = $state<Book[]>([]);
   let loading = $state(false);
@@ -38,7 +60,7 @@
   let analyzing = $state(false);
   let analysisResult = $state<AnalysisResult | null>(null);
   let analysisError = $state<string | null>(null);
-  let analysisProgress = $state<{ stage: string; progress: number } | null>(null);
+  let analysisProgress = $state<{ stage: string; progress: number; detail?: string } | null>(null);
 
   // Export state
   let exportedBooks = $state<Map<number, AnalysisResult>>(new Map());
@@ -47,10 +69,14 @@
   let unlistenProgress: (() => void) | null = null;
 
   onMount(async () => {
-    unlistenProgress = await listen<{ book_id: number; stage: string; progress: number }>(
+    unlistenProgress = await listen<{ book_id: number; stage: string; progress: number; detail?: string }>(
       "analysis-progress",
       (event) => {
-        analysisProgress = { stage: event.payload.stage, progress: event.payload.progress };
+        analysisProgress = {
+          stage: event.payload.stage,
+          progress: event.payload.progress,
+          detail: event.payload.detail,
+        };
       }
     );
   });
@@ -280,6 +306,9 @@
               <div class="progress-glow" style="width: {analysisProgress?.progress ?? 0}%"></div>
             </div>
             <p class="progress-stage">{analysisProgress?.stage ?? "Starting..."}</p>
+            {#if analysisProgress?.detail}
+              <p class="progress-detail">{analysisProgress.detail}</p>
+            {/if}
             <p class="hint">This may take a moment for longer books</p>
           </div>
         {:else if analysisError}
@@ -293,21 +322,48 @@
               <span class="stat-label">total words</span>
             </div>
             <div class="stat-card clay-card">
+              <span class="stat-value">{analysisResult.stats.total_candidates}</span>
+              <span class="stat-label">candidates</span>
+            </div>
+            <div class="stat-card clay-card highlight">
               <span class="stat-value">{analysisResult.hard_words.length}</span>
               <span class="stat-label">hard words</span>
             </div>
           </div>
 
+          {#if analysisResult.stats.filtered_by_ner.length > 0}
+            <button
+              class="filter-toggle clay-btn"
+              onclick={() => showFiltered = !showFiltered}
+            >
+              {showFiltered ? 'Hide' : 'Show'} {analysisResult.stats.filtered_by_ner.length} filtered names
+            </button>
+
+            {#if showFiltered}
+              <div class="filtered-words">
+                {#each analysisResult.stats.filtered_by_ner.slice(0, 50) as word}
+                  <span class="filtered-tag">{word}</span>
+                {/each}
+                {#if analysisResult.stats.filtered_by_ner.length > 50}
+                  <span class="filtered-more">+{analysisResult.stats.filtered_by_ner.length - 50} more</span>
+                {/if}
+              </div>
+            {/if}
+          {/if}
+
           <div class="word-list">
-            {#each analysisResult.hard_words as word, i}
+            {#each analysisResult.hard_words as hardWord, i}
               <div class="word-card clay-card" style="opacity: 0">
                 <div class="word-header">
                   <span class="rank">#{i + 1}</span>
-                  <span class="word">{word.word}</span>
-                  <span class="count">{word.count}×</span>
+                  <span class="word">{hardWord.word}</span>
+                  {#if hardWord.variants.length > 0}
+                    <span class="variants">({hardWord.variants.join(', ')})</span>
+                  {/if}
+                  <span class="count">{hardWord.count}×</span>
                 </div>
-                {#if word.contexts.length > 0}
-                  <p class="context">"{word.contexts[0]}"</p>
+                {#if hardWord.contexts.length > 0}
+                  <p class="context">{@html `"${highlightWord(hardWord.contexts[0], hardWord.word, hardWord.variants)}"`}</p>
                 {/if}
               </div>
             {/each}
@@ -812,13 +868,32 @@
 
   .progress-stage {
     font-weight: 600;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.25rem;
     color: var(--primary-dark);
   }
 
   @media (prefers-color-scheme: dark) {
     .progress-stage {
       color: var(--primary);
+    }
+  }
+
+  .progress-detail {
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: var(--text-muted-light);
+    margin-bottom: 0.5rem;
+    font-family: 'SF Mono', ui-monospace, monospace;
+    background: rgba(167, 139, 250, 0.1);
+    padding: 0.375rem 0.75rem;
+    border-radius: 8px;
+    display: inline-block;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .progress-detail {
+      color: var(--text-muted-dark);
+      background: rgba(167, 139, 250, 0.15);
     }
   }
 
@@ -841,15 +916,29 @@
 
   .stat-card {
     flex: 1;
-    padding: 1.25rem;
+    padding: 1rem;
     text-align: center;
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
   }
 
+  .stat-card.highlight {
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+  }
+
+  .stat-card.highlight .stat-value {
+    background: none;
+    -webkit-text-fill-color: white;
+    color: white;
+  }
+
+  .stat-card.highlight .stat-label {
+    color: rgba(255, 255, 255, 0.8);
+  }
+
   .stat-value {
-    font-size: 2rem;
+    font-size: 1.75rem;
     font-weight: 800;
     background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
     -webkit-background-clip: text;
@@ -858,15 +947,57 @@
   }
 
   .stat-label {
-    font-size: 0.875rem;
+    font-size: 0.75rem;
     color: var(--text-muted-light);
     font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
   }
 
   @media (prefers-color-scheme: dark) {
     .stat-label {
       color: var(--text-muted-dark);
     }
+  }
+
+  .filter-toggle {
+    width: 100%;
+    margin-bottom: 1rem;
+    padding: 0.625rem 1rem;
+    font-size: 0.875rem;
+    background: rgba(167, 139, 250, 0.1);
+  }
+
+  .filtered-words {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 1.5rem;
+    padding: 1rem;
+    background: rgba(239, 68, 68, 0.1);
+    border-radius: 12px;
+  }
+
+  .filtered-tag {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+    background: rgba(239, 68, 68, 0.2);
+    color: #dc2626;
+    border-radius: 6px;
+    font-weight: 500;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .filtered-tag {
+      background: rgba(239, 68, 68, 0.3);
+      color: #fca5a5;
+    }
+  }
+
+  .filtered-more {
+    font-size: 0.75rem;
+    color: var(--text-muted-light);
+    font-style: italic;
   }
 
   .word-list {
@@ -883,14 +1014,27 @@
   .word-header {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.5rem;
+    flex-wrap: wrap;
   }
 
   .rank {
     color: var(--text-muted-light);
-    font-size: 0.8rem;
+    font-size: 0.75rem;
     font-weight: 600;
-    min-width: 2.5rem;
+    min-width: 2rem;
+  }
+
+  .variants {
+    font-size: 0.75rem;
+    color: var(--text-muted-light);
+    font-style: italic;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .variants {
+      color: var(--text-muted-dark);
+    }
   }
 
   @media (prefers-color-scheme: dark) {
@@ -929,16 +1073,30 @@
 
   .context {
     margin: 0.75rem 0 0;
-    font-size: 0.9rem;
+    font-size: 0.875rem;
     color: var(--text-muted-light);
     font-style: italic;
-    line-height: 1.5;
-    padding-left: 3.25rem;
+    line-height: 1.6;
+    padding-left: 2.5rem;
+  }
+
+  .context :global(mark) {
+    background: linear-gradient(135deg, rgba(167, 139, 250, 0.3) 0%, rgba(124, 58, 237, 0.3) 100%);
+    color: var(--primary-dark);
+    font-style: normal;
+    font-weight: 600;
+    padding: 0.125rem 0.25rem;
+    border-radius: 4px;
   }
 
   @media (prefers-color-scheme: dark) {
     .context {
       color: var(--text-muted-dark);
+    }
+
+    .context :global(mark) {
+      background: linear-gradient(135deg, rgba(167, 139, 250, 0.4) 0%, rgba(124, 58, 237, 0.4) 100%);
+      color: var(--primary);
     }
   }
 </style>

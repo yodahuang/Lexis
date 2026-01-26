@@ -68,6 +68,7 @@ struct AnalysisResult {
     book_id: i64,
     word_count: usize,
     hard_words: Vec<nlp::HardWord>,
+    stats: nlp::AnalysisStats,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -75,6 +76,7 @@ struct AnalysisProgress {
     book_id: i64,
     stage: String,
     progress: u8, // 0-100
+    detail: Option<String>,
 }
 
 #[tauri::command]
@@ -95,35 +97,39 @@ async fn analyze_book(
     // Emit progress: extracting text
     let _ = window.emit("analysis-progress", AnalysisProgress {
         book_id,
-        stage: "Extracting text from EPUB...".to_string(),
+        stage: "Extracting text".to_string(),
         progress: 10,
+        detail: Some("Reading EPUB...".to_string()),
     });
 
     let extracted = epub::extract_text(&epub_path).map_err(|e| e.to_string())?;
     let word_count = extracted.full_text.split_whitespace().count();
 
-    // Emit progress: running NER
-    let _ = window.emit("analysis-progress", AnalysisProgress {
-        book_id,
-        stage: "Identifying names and places...".to_string(),
-        progress: 30,
-    });
-
-    // Run NLP analysis
+    // Run NLP analysis with progress callback
     let nlp = &state.nlp;
-    let hard_words = nlp.analyze(&extracted.full_text);
+    let window_clone = window.clone();
+    let (hard_words, stats) = nlp.analyze(&extracted.full_text, |progress| {
+        let _ = window_clone.emit("analysis-progress", AnalysisProgress {
+            book_id,
+            stage: progress.stage,
+            progress: progress.progress,
+            detail: progress.detail,
+        });
+    });
 
     // Emit progress: complete
     let _ = window.emit("analysis-progress", AnalysisProgress {
         book_id,
         stage: "Analysis complete!".to_string(),
         progress: 100,
+        detail: Some(format!("{} words found, {} filtered", hard_words.len(), stats.filtered_by_ner.len())),
     });
 
     Ok(AnalysisResult {
         book_id,
         word_count,
         hard_words,
+        stats,
     })
 }
 
