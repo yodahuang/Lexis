@@ -9,3 +9,6 @@
 # GLiNER model files (too large for git, download separately)
 /resources/gliner/*.onnx
 /resources/gliner/*.json
+
+# SymSpell dictionary (downloaded on first launch)
+/resources/symspell/*.txt

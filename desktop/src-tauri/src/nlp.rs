@@ -6,8 +6,11 @@ use ort::execution_providers::CoreMLExecutionProvider;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use symspell::{AsciiStringStrategy, SymSpell};
 use unicode_segmentation::UnicodeSegmentation;
 use wordfreq::WordFreq;
 use wordfreq_model::{load_wordfreq, ModelKind};
@@ -26,6 +29,13 @@ pub struct AnalysisProgress {
     pub stage: String,
     pub progress: u8,
     pub detail: Option<String>,
+    pub sample_words: Option<Vec<SampleWord>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct SampleWord {
+    pub word: String,
+    pub is_entity: bool, // true = will be filtered, false = kept
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -36,6 +46,10 @@ pub struct AnalysisStats {
 }
 
 static GLINER_MODEL: OnceLock<Option<GLiNER<SpanMode>>> = OnceLock::new();
+static SYMSPELL: OnceLock<Option<SymSpell<AsciiStringStrategy>>> = OnceLock::new();
+
+const SYMSPELL_DICT_URL: &str = "https://raw.githubusercontent.com/wolfgarbe/SymSpell/master/SymSpell/frequency_dictionary_en_82_765.txt";
+const SYMSPELL_DICT_FILENAME: &str = "frequency_dictionary_en_82_765.txt";
 
 pub struct NlpPipeline {
     wordfreq: WordFreq,
@@ -52,6 +66,58 @@ impl NlpPipeline {
     /// Stem a word (input must be lowercase)
     fn stem(&self, word: &str) -> String {
         self.stemmer.stem(word).to_string()
+    }
+
+    /// Check if a word looks like concatenated words (e.g., "believethat's")
+    /// Returns true if the word should be filtered out as malformed
+    fn is_malformed_word(&self, word: &str) -> bool {
+        // Skip short words - they can't be concatenations
+        if word.len() < 8 {
+            return false;
+        }
+
+        // Try symspell word segmentation first
+        if let Some(symspell) = get_symspell() {
+            // Handle words with apostrophes by checking the part before
+            let check_word = if let Some(pos) = word.find('\'') {
+                &word[..pos]
+            } else {
+                word
+            };
+
+            if check_word.len() >= 6 {
+                let segmentation = symspell.word_segmentation(check_word, 2);
+                let segments: Vec<&str> = segmentation.segmented_string.split_whitespace().collect();
+
+                // If segmentation found multiple words, it's likely concatenated
+                if segments.len() >= 2 {
+                    // Verify all segments are reasonable (at least 2 chars each)
+                    let all_valid = segments.iter().all(|s| s.len() >= 2);
+                    if all_valid {
+                        eprintln!("Filtering malformed word '{}' -> '{}'", word, segmentation.segmented_string);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Fallback: heuristic check for common patterns
+        let common_suffixes = [
+            "that's", "that", "the", "this", "they", "there", "their",
+            "have", "has", "had", "been", "being", "were", "was", "will",
+        ];
+
+        for suffix in &common_suffixes {
+            if word.ends_with(suffix) && word.len() > suffix.len() + 3 {
+                let prefix = &word[..word.len() - suffix.len()];
+                if self.wordfreq.word_frequency(prefix) > 0.0 {
+                    eprintln!("Filtering malformed word '{}' (heuristic: '{}' + '{}')", word, prefix, suffix);
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     pub fn is_gliner_available() -> bool {
@@ -107,9 +173,10 @@ impl NlpPipeline {
         mut on_progress: F,
     ) -> HashSet<String>
     where
-        F: FnMut(usize, usize, usize), // (sentences_processed, total_sentences, entities_found)
+        F: FnMut(usize, usize, usize, &[String]), // (sentences_processed, total_sentences, entities_found, recent_entities)
     {
         let mut entities = HashSet::new();
+        let mut recent_entities: Vec<String> = Vec::new();
 
         let Some(gliner) = self.get_gliner() else {
             return entities;
@@ -150,15 +217,23 @@ impl NlpPipeline {
                 }
             };
 
+            // Clear recent for this batch
+            recent_entities.clear();
+
             match gliner.inference(input) {
                 Ok(output) => {
                     for spans in output.spans.iter() {
                         for span in spans.iter() {
                             let entity_text = span.text().to_lowercase();
-                            entities.insert(entity_text.clone());
+                            if entities.insert(entity_text.clone()) {
+                                // New entity found
+                                recent_entities.push(entity_text.clone());
+                            }
                             // Also add individual words from multi-word entities
                             for word in entity_text.split_whitespace() {
-                                entities.insert(word.to_string());
+                                if entities.insert(word.to_string()) {
+                                    recent_entities.push(word.to_string());
+                                }
                             }
                         }
                     }
@@ -169,15 +244,15 @@ impl NlpPipeline {
             }
 
             processed += batch.len();
-            // Report progress after processing each batch
-            on_progress(processed, total_sentences, entities.len());
+            // Report progress after processing each batch with recent entities
+            on_progress(processed, total_sentences, entities.len(), &recent_entities);
         }
 
         eprintln!("GLiNER found {} unique entities", entities.len());
         entities
     }
 
-    pub fn analyze<F>(&self, text: &str, mut on_progress: F) -> (Vec<HardWord>, AnalysisStats)
+    pub fn analyze<F>(&self, text: &str, frequency_threshold: f32, mut on_progress: F) -> (Vec<HardWord>, AnalysisStats)
     where
         F: FnMut(AnalysisProgress),
     {
@@ -192,6 +267,7 @@ impl NlpPipeline {
             stage: "Analyzing text".to_string(),
             progress: 20,
             detail: Some(format!("{} sentences", sentences.len())),
+            sample_words: None,
         });
 
         eprintln!("Processing {} sentences...", sentences.len());
@@ -230,8 +306,8 @@ impl NlpPipeline {
                 }
                 entry.3.insert(lower); // Track original forms
 
-                // Store context sentence (limit to 3 per word)
-                if entry.1.len() < 3 && sentence.len() > 20 && sentence.len() < 500 {
+                // Store context sentence (no limit - UI will handle display)
+                if sentence.len() > 20 && sentence.len() < 500 {
                     let context = format!("{}.", sentence);
                     if !entry.1.contains(&context) {
                         entry.1.push(context);
@@ -245,6 +321,13 @@ impl NlpPipeline {
         let candidates: Vec<(String, usize, Vec<String>, bool, HashSet<String>)> = word_data
             .into_iter()
             .filter_map(|(stemmed, (count, contexts, needs_ner, original_forms))| {
+                // Filter out malformed words (EPUB parsing errors like "believethat's")
+                for form in &original_forms {
+                    if self.is_malformed_word(form) {
+                        return None;
+                    }
+                }
+
                 // Try stemmed form first, then original forms
                 let mut freq = self.wordfreq.word_frequency(&stemmed);
                 if freq == 0.0 {
@@ -258,7 +341,7 @@ impl NlpPipeline {
                 }
 
                 // Filter out very common words and words not in dictionary
-                if freq > 0.0001 || freq == 0.0 {
+                if freq > frequency_threshold || freq == 0.0 {
                     return None;
                 }
 
@@ -285,18 +368,61 @@ impl NlpPipeline {
             let total_ner_sentences = sentences_needing_ner.len();
             eprintln!("Running NER on {} sentences containing proper noun candidates...", total_ner_sentences);
 
+            // Get sample rare words (sorted by frequency, rarest first) to show in progress
+            let rare_word_samples: Vec<String> = {
+                let mut sorted_candidates: Vec<_> = candidates.iter()
+                    .map(|(_, _, _, _, forms)| {
+                        let form = forms.iter().next().cloned().unwrap_or_default();
+                        let freq = self.wordfreq.word_frequency(&form);
+                        (form, freq)
+                    })
+                    .filter(|(_, freq)| *freq > 0.0) // Must be in dictionary
+                    .collect();
+                sorted_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                sorted_candidates.into_iter().map(|(w, _)| w).take(20).collect()
+            };
+
             on_progress(AnalysisProgress {
                 stage: "Filtering names & places".to_string(),
                 progress: 40,
                 detail: Some(format!("0/{} sentences", total_ner_sentences)),
+                sample_words: None,
             });
 
-            self.extract_entities_from_sentences(&sentences_needing_ner, |processed, total, found| {
+            let mut sample_index = 0usize;
+            self.extract_entities_from_sentences(&sentences_needing_ner, |processed, total, found, recent_entities| {
                 let ner_progress = 40 + (processed * 40 / total.max(1)) as u8;
+
+                // Build sample words: recent entities (filtered) + rare candidates (kept)
+                let mut samples: Vec<SampleWord> = Vec::new();
+
+                // Add recent entities found this batch (these will be filtered)
+                for entity in recent_entities.iter().take(4) {
+                    samples.push(SampleWord {
+                        word: entity.clone(),
+                        is_entity: true,
+                    });
+                }
+
+                // Add some rare candidates (rotating through the list)
+                for i in 0..4 {
+                    let idx = (sample_index + i) % rare_word_samples.len().max(1);
+                    if let Some(word) = rare_word_samples.get(idx) {
+                        if !recent_entities.contains(word) {
+                            samples.push(SampleWord {
+                                word: word.clone(),
+                                is_entity: false,
+                            });
+                        }
+                    }
+                }
+                sample_index = (sample_index + 2) % rare_word_samples.len().max(1);
+
                 on_progress(AnalysisProgress {
                     stage: "Filtering names & places".to_string(),
                     progress: ner_progress.min(80),
                     detail: Some(format!("{}/{} sentences, {} names found", processed, total, found)),
+                    sample_words: if samples.is_empty() { None } else { Some(samples) },
                 });
             })
         } else {
@@ -305,6 +431,7 @@ impl NlpPipeline {
                 stage: "Filtering names & places".to_string(),
                 progress: 80,
                 detail: Some("No NER needed".to_string()),
+                sample_words: None,
             });
             HashSet::new()
         };
@@ -393,6 +520,7 @@ impl NlpPipeline {
             stage: "Complete".to_string(),
             progress: 100,
             detail: Some(format!("{} hard words found", scored_words.len())),
+            sample_words: None,
         });
 
         eprintln!("Final result: {} hard words, {} filtered by NER", scored_words.len(), filtered_by_ner.len());
@@ -407,7 +535,7 @@ impl NlpPipeline {
     }
 }
 
-fn get_gliner_model_dir() -> std::path::PathBuf {
+fn get_gliner_model_dir() -> PathBuf {
     // Check for bundled resources first
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
@@ -431,10 +559,98 @@ fn get_gliner_model_dir() -> std::path::PathBuf {
 
     // User data directory fallback
     dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("lexis")
         .join("models")
         .join("gliner")
+}
+
+fn get_symspell_dict_path() -> PathBuf {
+    // Check for bundled resources first
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let bundled = exe_dir.join("resources").join("symspell").join(SYMSPELL_DICT_FILENAME);
+            if bundled.exists() {
+                return bundled;
+            }
+            // macOS app bundle
+            let macos_bundled = exe_dir.join("../Resources/symspell").join(SYMSPELL_DICT_FILENAME);
+            if macos_bundled.exists() {
+                return macos_bundled;
+            }
+        }
+    }
+
+    // Development path
+    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("symspell")
+        .join(SYMSPELL_DICT_FILENAME);
+    dev_path
+}
+
+fn download_symspell_dict() -> Result<PathBuf, String> {
+    let dict_path = get_symspell_dict_path();
+
+    if dict_path.exists() {
+        return Ok(dict_path);
+    }
+
+    eprintln!("SymSpell dictionary not found, downloading...");
+
+    // Create directory if needed
+    if let Some(parent) = dict_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    // Download the dictionary
+    let response = ureq::get(SYMSPELL_DICT_URL)
+        .call()
+        .map_err(|e| format!("Failed to download dictionary: {}", e))?;
+
+    let mut content = Vec::new();
+    response.into_reader()
+        .read_to_end(&mut content)
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    // Write to file
+    let mut file = fs::File::create(&dict_path)
+        .map_err(|e| format!("Failed to create dictionary file: {}", e))?;
+    file.write_all(&content)
+        .map_err(|e| format!("Failed to write dictionary: {}", e))?;
+
+    eprintln!("SymSpell dictionary downloaded to {:?}", dict_path);
+    Ok(dict_path)
+}
+
+fn get_symspell() -> Option<&'static SymSpell<AsciiStringStrategy>> {
+    SYMSPELL.get_or_init(|| {
+        let dict_path = match download_symspell_dict() {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("Failed to get SymSpell dictionary: {}", e);
+                return None;
+            }
+        };
+
+        let mut symspell: SymSpell<AsciiStringStrategy> = SymSpell::default();
+
+        // Load the dictionary (term_index=0, count_index=1, separator=" ")
+        let loaded = symspell.load_dictionary(
+            dict_path.to_str().unwrap_or(""),
+            0,
+            1,
+            " ",
+        );
+
+        if !loaded {
+            eprintln!("Failed to load SymSpell dictionary from {:?}", dict_path);
+            return None;
+        }
+
+        eprintln!("SymSpell dictionary loaded successfully");
+        Some(symspell)
+    }).as_ref()
 }
 
 fn is_likely_proper_noun(word: &str, sentence: &str) -> bool {

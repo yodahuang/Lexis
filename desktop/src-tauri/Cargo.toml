@@ -31,6 +31,8 @@ unicode-segmentation = "1"
 wordfreq = "0.2"
 wordfreq-model = { version = "0.2", features = ["large-en"] }
 rust-stemmers = "1.2"
+symspell = "0.4"
+ureq = "2"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 gline-rs = { version = "1", features = ["coreml"] }
 ort = "2.0.0-rc.9"

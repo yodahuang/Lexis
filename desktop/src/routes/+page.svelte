@@ -50,6 +50,27 @@
   // Show filtered words toggle
   let showFiltered = $state(false);
 
+  // Frequency threshold (lower = rarer words only)
+  let frequencyThreshold = $state(0.00005);
+
+  // Track expanded word cards (for showing all contexts)
+  let expandedWords = $state<Set<number>>(new Set());
+
+  function toggleExpanded(index: number) {
+    const newSet = new Set(expandedWords);
+    if (newSet.has(index)) {
+      newSet.delete(index);
+    } else {
+      newSet.add(index);
+    }
+    expandedWords = newSet;
+  }
+
+  interface SampleWord {
+    word: string;
+    is_entity: boolean;
+  }
+
   let books = $state<Book[]>([]);
   let loading = $state(false);
   let error = $state<string | null>(null);
@@ -60,7 +81,7 @@
   let analyzing = $state(false);
   let analysisResult = $state<AnalysisResult | null>(null);
   let analysisError = $state<string | null>(null);
-  let analysisProgress = $state<{ stage: string; progress: number; detail?: string } | null>(null);
+  let analysisProgress = $state<{ stage: string; progress: number; detail?: string; sample_words?: SampleWord[] } | null>(null);
 
   // Export state
   let exportedBooks = $state<Map<number, AnalysisResult>>(new Map());
@@ -69,13 +90,14 @@
   let unlistenProgress: (() => void) | null = null;
 
   onMount(async () => {
-    unlistenProgress = await listen<{ book_id: number; stage: string; progress: number; detail?: string }>(
+    unlistenProgress = await listen<{ book_id: number; stage: string; progress: number; detail?: string; sample_words?: SampleWord[] }>(
       "analysis-progress",
       (event) => {
         analysisProgress = {
           stage: event.payload.stage,
           progress: event.payload.progress,
           detail: event.payload.detail,
+          sample_words: event.payload.sample_words,
         };
       }
     );
@@ -159,7 +181,10 @@
     analysisProgress = { stage: "Starting analysis...", progress: 0 };
 
     try {
-      const result: AnalysisResult = await invoke("analyze_book", { bookId: book.id });
+      const result: AnalysisResult = await invoke("analyze_book", {
+        bookId: book.id,
+        frequencyThreshold: frequencyThreshold,
+      });
       analysisResult = result;
       exportedBooks.set(book.id, result);
     } catch (e) {
@@ -237,6 +262,24 @@
     {/if}
   </div>
 
+  {#if libraryPath}
+    <div class="settings-row">
+      <label class="setting-label">
+        <span>Word rarity:</span>
+        <input
+          type="range"
+          min="0.000001"
+          max="0.0001"
+          step="0.000001"
+          bind:value={frequencyThreshold}
+        />
+        <span class="setting-value">
+          {frequencyThreshold < 0.00002 ? 'Very rare' : frequencyThreshold < 0.00005 ? 'Rare' : frequencyThreshold < 0.00008 ? 'Uncommon' : 'Common'}
+        </span>
+      </label>
+    </div>
+  {/if}
+
   {#if loading}
     <div class="loading-container">
       <div class="clay-loader"></div>
@@ -309,6 +352,28 @@
             {#if analysisProgress?.detail}
               <p class="progress-detail">{analysisProgress.detail}</p>
             {/if}
+
+            {#if analysisProgress?.stage === "Filtering names & places" && analysisProgress.sample_words?.length}
+              <div class="classifier-animation">
+                <div class="word-stream">
+                  {#each analysisProgress.sample_words as sample, i}
+                    <span
+                      class="flying-word"
+                      class:keep={!sample.is_entity}
+                      class:filter={sample.is_entity}
+                      style="animation-delay: {i * 0.15}s"
+                    >
+                      {sample.word}
+                    </span>
+                  {/each}
+                </div>
+                <div class="classifier-labels">
+                  <span class="label keep">Keep</span>
+                  <span class="label filter">Name/Place</span>
+                </div>
+              </div>
+            {/if}
+
             <p class="hint">This may take a moment for longer books</p>
           </div>
         {:else if analysisError}
@@ -363,7 +428,20 @@
                   <span class="count">{hardWord.count}×</span>
                 </div>
                 {#if hardWord.contexts.length > 0}
-                  <p class="context">{@html `"${highlightWord(hardWord.contexts[0], hardWord.word, hardWord.variants)}"`}</p>
+                  <div class="contexts-container">
+                    <p class="context">{@html `"${highlightWord(hardWord.contexts[0], hardWord.word, hardWord.variants)}"`}</p>
+
+                    {#if hardWord.contexts.length > 1}
+                      {#if expandedWords.has(i)}
+                        {#each hardWord.contexts.slice(1) as ctx}
+                          <p class="context extra">{@html `"${highlightWord(ctx, hardWord.word, hardWord.variants)}"`}</p>
+                        {/each}
+                      {/if}
+                      <button class="expand-btn" onclick={() => toggleExpanded(i)}>
+                        {expandedWords.has(i) ? 'Show less' : `+${hardWord.contexts.length - 1} more`}
+                      </button>
+                    {/if}
+                  </div>
                 {/if}
               </div>
             {/each}
@@ -560,6 +638,67 @@
     .library-path {
       color: var(--text-muted-dark);
       background: rgba(167, 139, 250, 0.15);
+    }
+  }
+
+  .settings-row {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    padding: 1rem 1.25rem;
+    background: var(--clay-light);
+    border-radius: 16px;
+    box-shadow: var(--clay-shadow-light);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .settings-row {
+      background: var(--clay-dark);
+      box-shadow: var(--clay-shadow-dark);
+    }
+  }
+
+  .setting-label {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    flex: 1;
+  }
+
+  .setting-label input[type="range"] {
+    flex: 1;
+    max-width: 200px;
+    height: 6px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(167, 139, 250, 0.2);
+    border-radius: 3px;
+    cursor: pointer;
+  }
+
+  .setting-label input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: 0 2px 6px rgba(124, 58, 237, 0.4);
+  }
+
+  .setting-value {
+    font-weight: 600;
+    color: var(--primary-dark);
+    min-width: 80px;
+    text-align: right;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .setting-value {
+      color: var(--primary);
     }
   }
 
@@ -855,15 +994,17 @@
     position: absolute;
     top: 0;
     left: 0;
+    width: 50%;
     height: 100%;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+    background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.6) 50%, transparent 100%);
     border-radius: 12px;
-    animation: shimmer 1.5s infinite;
+    animation: shimmer 1.2s ease-in-out infinite;
   }
 
   @keyframes shimmer {
-    0% { transform: translateX(-100%); }
-    100% { transform: translateX(100%); }
+    0% { transform: translateX(-100%); opacity: 0; }
+    50% { opacity: 1; }
+    100% { transform: translateX(200%); opacity: 0; }
   }
 
   .progress-stage {
@@ -906,6 +1047,84 @@
     .hint {
       color: var(--text-muted-dark);
     }
+  }
+
+  /* Classifier Animation */
+  .classifier-animation {
+    margin: 1.5rem 0;
+    padding: 1rem;
+    background: rgba(167, 139, 250, 0.08);
+    border-radius: 16px;
+    overflow: hidden;
+  }
+
+  .word-stream {
+    display: flex;
+    gap: 0.75rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-bottom: 1rem;
+  }
+
+  .flying-word {
+    padding: 0.375rem 0.75rem;
+    border-radius: 20px;
+    font-size: 0.875rem;
+    font-weight: 600;
+    animation: float 2s ease-in-out infinite;
+  }
+
+  .flying-word.keep {
+    background: linear-gradient(135deg, var(--success) 0%, var(--success-dark) 100%);
+    color: white;
+    animation-delay: 0s;
+  }
+
+  .flying-word.filter {
+    background: linear-gradient(135deg, #fca5a5 0%, #ef4444 100%);
+    color: white;
+    animation-delay: 0.3s;
+  }
+
+  .flying-word:nth-child(2) { animation-delay: 0.2s; }
+  .flying-word:nth-child(3) { animation-delay: 0.4s; }
+  .flying-word:nth-child(4) { animation-delay: 0.6s; }
+  .flying-word:nth-child(5) { animation-delay: 0.8s; }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0) scale(1); opacity: 0.7; }
+    50% { transform: translateY(-8px) scale(1.05); opacity: 1; }
+  }
+
+  .classifier-labels {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+  }
+
+  .classifier-labels .label {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .classifier-labels .label::before {
+    content: '';
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+
+  .classifier-labels .label.keep::before {
+    background: var(--success);
+  }
+
+  .classifier-labels .label.filter::before {
+    background: #ef4444;
   }
 
   .analysis-summary {
@@ -1071,13 +1290,23 @@
     }
   }
 
+  .contexts-container {
+    margin-top: 0.75rem;
+    padding-left: 2.5rem;
+  }
+
   .context {
-    margin: 0.75rem 0 0;
+    margin: 0;
     font-size: 0.875rem;
     color: var(--text-muted-light);
     font-style: italic;
     line-height: 1.6;
-    padding-left: 2.5rem;
+  }
+
+  .context.extra {
+    margin-top: 0.5rem;
+    padding-top: 0.5rem;
+    border-top: 1px dashed rgba(167, 139, 250, 0.2);
   }
 
   .context :global(mark) {
@@ -1089,6 +1318,23 @@
     border-radius: 4px;
   }
 
+  .expand-btn {
+    margin-top: 0.5rem;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    background: rgba(167, 139, 250, 0.1);
+    border: none;
+    border-radius: 12px;
+    color: var(--primary-dark);
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .expand-btn:hover {
+    background: rgba(167, 139, 250, 0.2);
+  }
+
   @media (prefers-color-scheme: dark) {
     .context {
       color: var(--text-muted-dark);
@@ -1096,6 +1342,10 @@
 
     .context :global(mark) {
       background: linear-gradient(135deg, rgba(167, 139, 250, 0.4) 0%, rgba(124, 58, 237, 0.4) 100%);
+      color: var(--primary);
+    }
+
+    .expand-btn {
       color: var(--primary);
     }
   }

@@ -77,14 +77,17 @@ struct AnalysisProgress {
     stage: String,
     progress: u8, // 0-100
     detail: Option<String>,
+    sample_words: Option<Vec<nlp::SampleWord>>,
 }
 
 #[tauri::command]
 async fn analyze_book(
     book_id: i64,
+    frequency_threshold: Option<f32>,
     window: tauri::Window,
     state: tauri::State<'_, AppState>,
 ) -> Result<AnalysisResult, String> {
+    let threshold = frequency_threshold.unwrap_or(0.00005); // Default: rarer words only
     let lib_path = {
         let guard = state.library_path.lock().unwrap();
         guard.clone().ok_or("No library loaded")?
@@ -100,6 +103,7 @@ async fn analyze_book(
         stage: "Extracting text".to_string(),
         progress: 10,
         detail: Some("Reading EPUB...".to_string()),
+        sample_words: None,
     });
 
     let extracted = epub::extract_text(&epub_path).map_err(|e| e.to_string())?;
@@ -108,12 +112,13 @@ async fn analyze_book(
     // Run NLP analysis with progress callback
     let nlp = &state.nlp;
     let window_clone = window.clone();
-    let (hard_words, stats) = nlp.analyze(&extracted.full_text, |progress| {
+    let (hard_words, stats) = nlp.analyze(&extracted.full_text, threshold, |progress| {
         let _ = window_clone.emit("analysis-progress", AnalysisProgress {
             book_id,
             stage: progress.stage,
             progress: progress.progress,
             detail: progress.detail,
+            sample_words: progress.sample_words,
         });
     });
 
@@ -123,6 +128,7 @@ async fn analyze_book(
         stage: "Analysis complete!".to_string(),
         progress: 100,
         detail: Some(format!("{} words found, {} filtered", hard_words.len(), stats.filtered_by_ner.len())),
+        sample_words: None,
     });
 
     Ok(AnalysisResult {
