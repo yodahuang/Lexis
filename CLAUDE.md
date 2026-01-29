@@ -88,7 +88,7 @@ Text → Sentences → Words → Wordfreq Filter → Malformed Filter → Stemmi
 
 ```bash
 devenv shell              # Enter dev environment
-cd desktop && bun install # Install frontend deps (first time)
+bun install               # Install frontend deps (first time)
 dev                       # Run app in dev mode (devenv script)
 build                     # Build for production
 
@@ -101,20 +101,19 @@ test                      # Run all Rust tests
 
 ```
 lexis/
-├── desktop/              # Tauri app
-│   ├── src/              # Svelte frontend
-│   ├── src-tauri/        # Rust backend
-│   │   ├── src/
-│   │   │   ├── main.rs
-│   │   │   ├── calibre.rs    # Calibre DB queries
-│   │   │   ├── epub.rs       # EPUB text extraction
-│   │   │   ├── nlp.rs        # Word frequency analysis
-│   │   │   └── export.rs     # JSON export
-│   │   ├── tests/
-│   │   │   ├── fixtures/     # Test books (gitignored, download via setup-test-fixtures)
-│   │   │   └── nlp_filtering.rs  # NLP pipeline integration tests
-│   │   └── Cargo.toml
-│   └── package.json
+├── src/                  # Svelte frontend
+├── src-tauri/            # Rust backend
+│   ├── src/
+│   │   ├── main.rs
+│   │   ├── calibre.rs    # Calibre DB queries
+│   │   ├── epub.rs       # EPUB text extraction
+│   │   ├── nlp.rs        # Word frequency analysis
+│   │   └── export.rs     # JSON export
+│   ├── tests/
+│   │   ├── fixtures/     # Test books (gitignored, download via setup-test-fixtures)
+│   │   └── nlp_filtering.rs  # NLP pipeline integration tests
+│   └── Cargo.toml
+├── package.json
 ├── devenv.nix
 └── CLAUDE.md
 ```

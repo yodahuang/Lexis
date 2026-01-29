@@ -2,7 +2,6 @@
 
 {
   packages = [
-    pkgs.claude-code
     pkgs.curl
   ];
 
@@ -13,14 +12,14 @@
   };
 
   # Development commands
-  scripts.dev.exec = "cd desktop && cargo tauri dev";
-  scripts.build.exec = "cd desktop && cargo tauri build";
+  scripts.dev.exec = "cargo tauri dev";
+  scripts.build.exec = "cargo tauri build";
 
   # Testing
-  scripts.test.exec = "cd desktop/src-tauri && cargo test";
+  scripts.test.exec = "cd src-tauri && cargo test";
   scripts.setup-test-fixtures.exec = ''
-    mkdir -p desktop/src-tauri/tests/fixtures
-    FIXTURE_PATH="desktop/src-tauri/tests/fixtures/pride_and_prejudice.txt"
+    mkdir -p src-tauri/tests/fixtures
+    FIXTURE_PATH="src-tauri/tests/fixtures/pride_and_prejudice.txt"
 
     if [ -f "$FIXTURE_PATH" ]; then
       echo "Test fixture already exists at $FIXTURE_PATH"
