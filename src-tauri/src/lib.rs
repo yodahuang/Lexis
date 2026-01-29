@@ -1,6 +1,6 @@
 mod calibre;
 mod epub;
-mod nlp;
+pub mod nlp;
 mod resources;
 
 use std::collections::HashMap;

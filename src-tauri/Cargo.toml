@@ -39,3 +39,6 @@ ort = "2.0.0-rc.9"
 orp = "0.9"
 dirs = "5"
 
+[dev-dependencies]
+rust-stemmers = "1.2"  # For tests that check stemming
+

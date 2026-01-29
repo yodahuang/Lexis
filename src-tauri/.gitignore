@@ -12,3 +12,6 @@
 
 # SymSpell dictionary (downloaded on first launch)
 /resources/symspell/*.txt
+
+# Test fixtures (downloaded via `devenv up` or setup script)
+/tests/fixtures/

@@ -56,6 +56,8 @@ Text → Sentences → Words → Wordfreq Filter → Malformed Filter → Stemmi
 - **Job cancellation**: Closing modal doesn't cancel background analysis
 - **Job queue**: Multiple analyses can run simultaneously (interleaved progress)
 - **Normalization timing**: Words like "blaster's" shown in progress before normalization
+- **Symspell over-segmentation**: Valid dictionary words like "discomposed", "palpitated", "provokingly" are incorrectly filtered as malformed because symspell can segment them (e.g., "discomposed" → "dis composed"). The wordfreq check should prevent this but these words may not be in the wordfreq dictionary.
+- **Possessive names filtered**: Words like "bingley's", "georgiana's" are incorrectly segmented. These should be handled by NER, not malformed detection.
 
 ## Export Format
 
@@ -85,26 +87,33 @@ Text → Sentences → Words → Wordfreq Filter → Malformed Filter → Stemmi
 ## Development
 
 ```bash
-devenv shell           # Enter dev environment
-cd desktop && bun install
-cargo tauri dev        # Run in dev mode
+devenv shell              # Enter dev environment
+bun install               # Install frontend deps (first time)
+dev                       # Run app in dev mode (devenv script)
+build                     # Build for production
+
+# Testing
+setup-test-fixtures       # Download Gutenberg test books (one-time)
+test                      # Run all Rust tests
 ```
 
 ## Project Structure
 
 ```
 lexis/
-├── desktop/              # Tauri app
-│   ├── src/              # Svelte frontend
-│   ├── src-tauri/        # Rust backend
-│   │   ├── src/
-│   │   │   ├── main.rs
-│   │   │   ├── calibre.rs    # Calibre DB queries
-│   │   │   ├── epub.rs       # EPUB text extraction
-│   │   │   ├── nlp.rs        # Word frequency analysis
-│   │   │   └── export.rs     # JSON export
-│   │   └── Cargo.toml
-│   └── package.json
+├── src/                  # Svelte frontend
+├── src-tauri/            # Rust backend
+│   ├── src/
+│   │   ├── main.rs
+│   │   ├── calibre.rs    # Calibre DB queries
+│   │   ├── epub.rs       # EPUB text extraction
+│   │   ├── nlp.rs        # Word frequency analysis
+│   │   └── export.rs     # JSON export
+│   ├── tests/
+│   │   ├── fixtures/     # Test books (gitignored, download via setup-test-fixtures)
+│   │   └── nlp_filtering.rs  # NLP pipeline integration tests
+│   └── Cargo.toml
+├── package.json
 ├── devenv.nix
 └── CLAUDE.md
 ```

@@ -8,3 +8,23 @@ devenv.local.yaml
 
 # pre-commit
 .pre-commit-config.yaml
+
+# macOS
+.DS_Store
+
+# Node
+node_modules
+
+# SvelteKit
+/build
+/.svelte-kit
+/package
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
