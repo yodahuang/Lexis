@@ -71,13 +71,34 @@
     is_entity: boolean;
   }
 
+  interface ResourceStatus {
+    gliner_available: boolean;
+    gliner_path: string;
+    symspell_available: boolean;
+    symspell_path: string;
+  }
+
+  interface ResourceDownloadProgress {
+    resource: string;
+    file: string;
+    downloaded: number;
+    total: number;
+    status: string;
+  }
+
   let books = $state<Book[]>([]);
   let loading = $state(false);
   let error = $state<string | null>(null);
   let libraryPath = $state<string | null>(null);
 
+  // Resource management state
+  let resourceStatus = $state<ResourceStatus | null>(null);
+  let downloadingResources = $state(false);
+  let downloadProgress = $state<ResourceDownloadProgress | null>(null);
+
   // Analysis state
-  let selectedBook = $state<Book | null>(null);
+  let selectedBook = $state<Book | null>(null);  // Book shown in modal (null when minimized)
+  let analyzingBook = $state<Book | null>(null); // Book currently being analyzed (persists when minimized)
   let analyzing = $state(false);
   let analysisResult = $state<AnalysisResult | null>(null);
   let analysisError = $state<string | null>(null);
@@ -88,8 +109,17 @@
 
   // Listen for progress events
   let unlistenProgress: (() => void) | null = null;
+  let unlistenResourceProgress: (() => void) | null = null;
 
   onMount(async () => {
+    // Check resource status on load
+    try {
+      resourceStatus = await invoke("get_resource_status");
+    } catch (e) {
+      console.error('Failed to get resource status:', e);
+    }
+
+    // Listen for analysis progress
     unlistenProgress = await listen<{ book_id: number; stage: string; progress: number; detail?: string; sample_words?: SampleWord[] }>(
       "analysis-progress",
       (event) => {
@@ -101,11 +131,36 @@
         };
       }
     );
+
+    // Listen for resource download progress
+    unlistenResourceProgress = await listen<ResourceDownloadProgress>(
+      "resource-download-progress",
+      (event) => {
+        downloadProgress = event.payload;
+      }
+    );
   });
 
   onDestroy(() => {
     if (unlistenProgress) unlistenProgress();
+    if (unlistenResourceProgress) unlistenResourceProgress();
   });
+
+  async function downloadResources() {
+    downloadingResources = true;
+    downloadProgress = null;
+    try {
+      await invoke("download_resources");
+      // Refresh status after download
+      resourceStatus = await invoke("get_resource_status");
+    } catch (e) {
+      console.error('Failed to download resources:', e);
+      error = `Failed to download resources: ${e}`;
+    } finally {
+      downloadingResources = false;
+      downloadProgress = null;
+    }
+  }
 
   // Animate books when they load
   $effect(() => {
@@ -142,6 +197,7 @@
     }
   });
 
+
   async function selectLibrary() {
     const selected = await open({
       directory: true,
@@ -175,6 +231,7 @@
 
   async function analyzeBook(book: Book) {
     selectedBook = book;
+    analyzingBook = book;
     analyzing = true;
     analysisError = null;
     analysisResult = null;
@@ -195,33 +252,43 @@
       }
     } finally {
       analyzing = false;
+      analyzingBook = null;
       analysisProgress = null;
     }
   }
 
   async function cancelAnalysis() {
-    if (selectedBook) {
-      await invoke("cancel_analysis", { bookId: selectedBook.id });
+    if (analyzingBook) {
+      await invoke("cancel_analysis", { bookId: analyzingBook.id });
       analyzing = false;
+      analyzingBook = null;
       analysisProgress = null;
     }
   }
 
   function closeModal() {
     // Cancel any running analysis when closing
-    if (analyzing && selectedBook) {
-      invoke("cancel_analysis", { bookId: selectedBook.id });
+    if (analyzing && analyzingBook) {
+      invoke("cancel_analysis", { bookId: analyzingBook.id });
+      analyzingBook = null;
+      analyzing = false;
+      analysisProgress = null;
     }
     selectedBook = null;
     analysisResult = null;
     analysisError = null;
-    analyzing = false;
-    analysisProgress = null;
   }
 
   function minimizeModal() {
     // Hide modal but keep analysis running in background
     selectedBook = null;
+  }
+
+  function restoreFromProgress() {
+    // Re-open modal for the book currently being analyzed
+    if (analyzingBook) {
+      selectedBook = analyzingBook;
+    }
   }
 
   async function exportToJson() {
@@ -271,6 +338,51 @@
     <p class="subtitle">Extract vocabulary from your ebook library</p>
   </header>
 
+  {#if resourceStatus && (!resourceStatus.gliner_available || !resourceStatus.symspell_available)}
+    <div class="resource-banner clay-card">
+      {#if downloadingResources}
+        <div class="resource-downloading">
+          <div class="resource-spinner"></div>
+          <div class="resource-info">
+            <p class="resource-title">Downloading NLP resources...</p>
+            {#if downloadProgress}
+              <p class="resource-detail">
+                {downloadProgress.file}
+                {#if downloadProgress.total > 0}
+                  ({Math.round(downloadProgress.downloaded / 1024 / 1024)}MB / {Math.round(downloadProgress.total / 1024 / 1024)}MB)
+                {/if}
+              </p>
+              <div class="resource-progress-bar">
+                <div class="resource-progress-fill" style="width: {downloadProgress.total > 0 ? (downloadProgress.downloaded / downloadProgress.total * 100) : 0}%"></div>
+              </div>
+            {:else}
+              <p class="resource-detail">Preparing download...</p>
+            {/if}
+          </div>
+        </div>
+      {:else}
+        <div class="resource-missing">
+          <span class="resource-icon">&#x26A0;</span>
+          <div class="resource-info">
+            <p class="resource-title">NLP resources not found</p>
+            <p class="resource-detail">
+              {#if !resourceStatus.gliner_available && !resourceStatus.symspell_available}
+                NER model (~650MB) and dictionary required
+              {:else if !resourceStatus.gliner_available}
+                NER model (~650MB) required for name/place filtering
+              {:else}
+                SymSpell dictionary required for word detection
+              {/if}
+            </p>
+          </div>
+          <button class="clay-btn primary" onclick={downloadResources}>
+            Download Resources
+          </button>
+        </div>
+      {/if}
+    </div>
+  {/if}
+
   <div class="controls">
     <button class="clay-btn primary" onclick={selectLibrary} disabled={loading}>
       {libraryPath ? "Change Library" : "Select Calibre Library"}
@@ -293,11 +405,11 @@
           type="range"
           min="0.000001"
           max="0.0001"
-          step="0.000001"
+          step="0.0000001"
           bind:value={frequencyThreshold}
         />
         <span class="setting-value">
-          {frequencyThreshold < 0.00002 ? 'Very rare' : frequencyThreshold < 0.00005 ? 'Rare' : frequencyThreshold < 0.00008 ? 'Uncommon' : 'Common'}
+          {frequencyThreshold < 0.00001 ? 'Very rare' : frequencyThreshold < 0.00003 ? 'Rare' : frequencyThreshold < 0.00006 ? 'Uncommon' : 'Common'}
         </span>
       </label>
     </div>
@@ -355,6 +467,18 @@
   {/if}
 </main>
 
+{#if analyzing && !selectedBook && analyzingBook}
+  <button class="progress-panel clay-card" onclick={restoreFromProgress}>
+    <div class="progress-panel-header">
+      <span class="progress-panel-title">{analyzingBook.title}</span>
+      <span class="progress-panel-stage">{analysisProgress?.stage ?? "Analyzing..."}</span>
+    </div>
+    <div class="progress-panel-bar">
+      <div class="progress-panel-fill" style="width: {analysisProgress?.progress ?? 0}%"></div>
+    </div>
+  </button>
+{/if}
+
 {#if selectedBook}
   <div class="modal-overlay" onclick={closeModal}>
     <div class="modal clay-card" onclick={(e) => e.stopPropagation()} style="opacity: 0">
@@ -376,23 +500,22 @@
               <p class="progress-detail">{analysisProgress.detail}</p>
             {/if}
 
-            {#if analysisProgress?.stage === "Filtering names & places" && analysisProgress.sample_words?.length}
-              <div class="classifier-animation">
-                <div class="word-stream">
-                  {#each analysisProgress.sample_words as sample, i}
+            {#if analysisProgress?.sample_words?.length}
+              <div class="candidate-words-panel">
+                <div class="candidate-words-grid">
+                  {#each analysisProgress.sample_words as candidate}
                     <span
-                      class="flying-word"
-                      class:keep={!sample.is_entity}
-                      class:filter={sample.is_entity}
-                      style="animation-delay: {i * 0.15}s"
+                      class="candidate-word"
+                      class:keep={!candidate.is_entity}
+                      class:filtered={candidate.is_entity}
                     >
-                      {sample.word}
+                      {candidate.word}
                     </span>
                   {/each}
                 </div>
-                <div class="classifier-labels">
-                  <span class="label keep">Keep</span>
-                  <span class="label filter">Name/Place</span>
+                <div class="candidate-legend">
+                  <span class="legend-item keep">Keep</span>
+                  <span class="legend-item filtered">Name/Place</span>
                 </div>
               </div>
             {/if}
@@ -647,6 +770,75 @@
     .clay-btn:active:not(:disabled) {
       box-shadow: var(--clay-shadow-pressed-dark);
     }
+  }
+
+  /* Resource Banner */
+  .resource-banner {
+    padding: 1rem 1.5rem;
+    margin-bottom: 1.5rem;
+    background: linear-gradient(135deg, rgba(251, 191, 36, 0.15) 0%, rgba(245, 158, 11, 0.15) 100%);
+    border: 1px solid rgba(251, 191, 36, 0.3);
+  }
+
+  .resource-missing, .resource-downloading {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+  }
+
+  .resource-icon {
+    font-size: 1.5rem;
+    color: #f59e0b;
+  }
+
+  .resource-info {
+    flex: 1;
+  }
+
+  .resource-title {
+    margin: 0;
+    font-weight: 600;
+    font-size: 0.95rem;
+  }
+
+  .resource-detail {
+    margin: 0.25rem 0 0;
+    font-size: 0.85rem;
+    color: var(--text-muted-light);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .resource-detail {
+      color: var(--text-muted-dark);
+    }
+  }
+
+  .resource-spinner {
+    width: 24px;
+    height: 24px;
+    border: 3px solid rgba(167, 139, 250, 0.3);
+    border-top-color: var(--primary);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .resource-progress-bar {
+    margin-top: 0.5rem;
+    height: 6px;
+    background: rgba(167, 139, 250, 0.2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .resource-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--primary) 0%, var(--primary-dark) 100%);
+    border-radius: 3px;
+    transition: width 0.3s ease;
   }
 
   .controls {
@@ -1107,61 +1299,64 @@
     background: linear-gradient(145deg, #4b5563, #374151);
   }
 
-  /* Classifier Animation */
-  .classifier-animation {
+  /* Candidate Words Panel - shows all words being classified */
+  .candidate-words-panel {
     margin: 1.5rem 0;
     padding: 1rem;
     background: rgba(167, 139, 250, 0.08);
     border-radius: 16px;
-    overflow: hidden;
+    max-height: 200px;
+    overflow-y: auto;
   }
 
-  .word-stream {
+  .candidate-words-grid {
     display: flex;
-    gap: 0.75rem;
-    justify-content: center;
+    gap: 0.5rem;
     flex-wrap: wrap;
     margin-bottom: 1rem;
   }
 
-  .flying-word {
-    padding: 0.375rem 0.75rem;
-    border-radius: 20px;
-    font-size: 0.875rem;
+  .candidate-word {
+    padding: 0.25rem 0.625rem;
+    border-radius: 12px;
+    font-size: 0.8rem;
     font-weight: 600;
-    animation: float 2s ease-in-out infinite;
+    transition: all 0.3s ease;
   }
 
-  .flying-word.keep {
-    background: linear-gradient(135deg, var(--success) 0%, var(--success-dark) 100%);
-    color: white;
-    animation-delay: 0s;
+  .candidate-word.keep {
+    background: rgba(110, 231, 183, 0.2);
+    color: var(--success-dark);
+    border: 1px solid rgba(110, 231, 183, 0.4);
   }
 
-  .flying-word.filter {
-    background: linear-gradient(135deg, #fca5a5 0%, #ef4444 100%);
-    color: white;
-    animation-delay: 0.3s;
+  .candidate-word.filtered {
+    background: rgba(239, 68, 68, 0.2);
+    color: #dc2626;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    text-decoration: line-through;
+    opacity: 0.7;
   }
 
-  .flying-word:nth-child(2) { animation-delay: 0.2s; }
-  .flying-word:nth-child(3) { animation-delay: 0.4s; }
-  .flying-word:nth-child(4) { animation-delay: 0.6s; }
-  .flying-word:nth-child(5) { animation-delay: 0.8s; }
-
-  @keyframes float {
-    0%, 100% { transform: translateY(0) scale(1); opacity: 0.7; }
-    50% { transform: translateY(-8px) scale(1.05); opacity: 1; }
+  @media (prefers-color-scheme: dark) {
+    .candidate-word.keep {
+      color: var(--success);
+    }
+    .candidate-word.filtered {
+      color: #fca5a5;
+    }
   }
 
-  .classifier-labels {
+  .candidate-legend {
     display: flex;
     justify-content: center;
     gap: 2rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid rgba(167, 139, 250, 0.2);
   }
 
-  .classifier-labels .label {
-    font-size: 0.75rem;
+  .legend-item {
+    font-size: 0.7rem;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -1170,18 +1365,18 @@
     gap: 0.5rem;
   }
 
-  .classifier-labels .label::before {
+  .legend-item::before {
     content: '';
     width: 8px;
     height: 8px;
     border-radius: 50%;
   }
 
-  .classifier-labels .label.keep::before {
+  .legend-item.keep::before {
     background: var(--success);
   }
 
-  .classifier-labels .label.filter::before {
+  .legend-item.filtered::before {
     background: #ef4444;
   }
 
@@ -1406,5 +1601,97 @@
     .expand-btn {
       color: var(--primary);
     }
+  }
+
+  /* Progress Panel - floating indicator for background analysis */
+  .progress-panel {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    width: 280px;
+    padding: 1rem 1.25rem;
+    z-index: 50;
+    cursor: pointer;
+    border: none;
+    text-align: left;
+    animation: slideUp 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .progress-panel:hover {
+    transform: translateY(-4px);
+    box-shadow:
+      10px 10px 20px rgba(166, 139, 214, 0.3),
+      -10px -10px 20px rgba(255, 255, 255, 0.9),
+      inset 2px 2px 4px rgba(255, 255, 255, 0.6),
+      inset -1px -1px 3px rgba(166, 139, 214, 0.15);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .progress-panel:hover {
+      box-shadow:
+        10px 10px 20px rgba(0, 0, 0, 0.5),
+        -10px -10px 20px rgba(60, 50, 80, 0.4),
+        inset 2px 2px 4px rgba(60, 50, 80, 0.4),
+        inset -1px -1px 3px rgba(0, 0, 0, 0.2);
+    }
+  }
+
+  @keyframes slideUp {
+    from {
+      opacity: 0;
+      transform: translateY(20px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  .progress-panel-header {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .progress-panel-title {
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--text-light);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .progress-panel-title {
+      color: var(--text-dark);
+    }
+  }
+
+  .progress-panel-stage {
+    font-size: 0.75rem;
+    color: var(--primary-dark);
+    font-weight: 600;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    .progress-panel-stage {
+      color: var(--primary);
+    }
+  }
+
+  .progress-panel-bar {
+    height: 6px;
+    background: rgba(167, 139, 250, 0.2);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .progress-panel-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--primary) 0%, var(--primary-dark) 100%);
+    border-radius: 6px;
+    transition: width 0.3s ease;
   }
 </style>
