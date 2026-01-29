@@ -1,6 +1,6 @@
 mod calibre;
 mod epub;
-mod nlp;
+pub mod nlp;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
