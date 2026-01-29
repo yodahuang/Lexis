@@ -12,8 +12,8 @@
   };
 
   # Development commands
-  scripts.dev.exec = "cargo tauri dev";
-  scripts.build.exec = "cargo tauri build";
+  scripts.dev.exec = "bun run dev";
+  scripts.build.exec = "bun run build";
 
   # Testing
   scripts.test.exec = "cd src-tauri && cargo test";
