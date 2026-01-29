@@ -1,11 +1,13 @@
 mod calibre;
 mod epub;
 pub mod nlp;
+mod resources;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
+use tokio::sync::mpsc;
 
 pub struct AppState {
     pub library_path: Mutex<Option<String>>,
@@ -137,24 +139,52 @@ async fn analyze_book(
         return Err("Analysis cancelled".to_string());
     }
 
-    // Run NLP analysis with progress callback and cancellation check
-    let nlp = &state.nlp;
-    let window_clone = window.clone();
+    // Run NLP analysis on a blocking thread with channel-based progress reporting
+    // We use a channel to relay progress from the blocking thread to an async task
+    // that can properly emit events through Tauri's event loop
+    let text = extracted.full_text;
     let cancel_clone = Arc::clone(&cancel_token);
-    let result = nlp.analyze_with_cancel(&extracted.full_text, threshold, &cancel_clone, |progress| {
-        let _ = window_clone.emit("analysis-progress", AnalysisProgress {
-            book_id,
-            stage: progress.stage,
-            progress: progress.progress,
-            detail: progress.detail,
-            sample_words: progress.sample_words,
-        });
+
+    // Channel for progress updates from blocking thread
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<nlp::AnalysisProgress>();
+
+    // Spawn async task to relay progress events to the window
+    let window_clone = window.clone();
+    let progress_relay = tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let _ = window_clone.emit("analysis-progress", AnalysisProgress {
+                book_id,
+                stage: progress.stage,
+                progress: progress.progress,
+                detail: progress.detail,
+                sample_words: progress.sample_words,
+            });
+            // Small yield to allow event loop to process
+            tokio::task::yield_now().await;
+        }
     });
+
+    // Give the relay task a chance to start
+    tokio::task::yield_now().await;
+
+    let nlp_result = tokio::task::spawn_blocking(move || {
+        let nlp = nlp::NlpPipeline::new();
+        let result = nlp.analyze_with_cancel(&text, threshold, &cancel_clone, |progress| {
+            let _ = progress_tx.send(progress);
+        });
+        drop(progress_tx);
+        result
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    // Wait for relay to finish processing remaining events (it will exit when sender is dropped)
+    let _ = progress_relay.await;
 
     // Clean up job tracking
     cleanup_job(&state, book_id);
 
-    let (hard_words, stats) = result.ok_or("Analysis cancelled")?;
+    let (hard_words, stats) = nlp_result.ok_or("Analysis cancelled")?;
 
     let _ = window.emit("analysis-progress", AnalysisProgress {
         book_id,
@@ -200,13 +230,130 @@ fn export_json(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn get_resource_status() -> resources::ResourceStatus {
+    resources::get_resource_status()
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ResourceDownloadProgress {
+    resource: String,
+    file: String,
+    downloaded: u64,
+    total: u64,
+    status: String,
+}
+
+#[tauri::command]
+async fn download_resources(window: tauri::Window) -> Result<(), String> {
+    // Download GLiNER model in a blocking thread (it's a large download)
+    let window_clone = window.clone();
+
+    tokio::task::spawn_blocking(move || {
+        // Download GLiNER model
+        let result = resources::ensure_gliner_model(|status| {
+            let progress = match status {
+                resources::DownloadStatus::AlreadyExists => ResourceDownloadProgress {
+                    resource: "gliner".to_string(),
+                    file: "".to_string(),
+                    downloaded: 0,
+                    total: 0,
+                    status: "exists".to_string(),
+                },
+                resources::DownloadStatus::Downloading { file, progress, total } => ResourceDownloadProgress {
+                    resource: "gliner".to_string(),
+                    file,
+                    downloaded: progress,
+                    total,
+                    status: "downloading".to_string(),
+                },
+                resources::DownloadStatus::Completed => ResourceDownloadProgress {
+                    resource: "gliner".to_string(),
+                    file: "".to_string(),
+                    downloaded: 0,
+                    total: 0,
+                    status: "completed".to_string(),
+                },
+                resources::DownloadStatus::Failed(err) => ResourceDownloadProgress {
+                    resource: "gliner".to_string(),
+                    file: "".to_string(),
+                    downloaded: 0,
+                    total: 0,
+                    status: format!("failed: {}", err),
+                },
+            };
+            let _ = window_clone.emit("resource-download-progress", progress);
+        });
+
+        if let Err(e) = result {
+            eprintln!("Failed to download GLiNER model: {}", e);
+            return Err(e);
+        }
+
+        // Download SymSpell dictionary (usually already exists)
+        let window_clone2 = window_clone.clone();
+        let result = resources::ensure_symspell_dict(|status| {
+            let progress = match status {
+                resources::DownloadStatus::AlreadyExists => ResourceDownloadProgress {
+                    resource: "symspell".to_string(),
+                    file: "".to_string(),
+                    downloaded: 0,
+                    total: 0,
+                    status: "exists".to_string(),
+                },
+                resources::DownloadStatus::Downloading { file, progress, total } => ResourceDownloadProgress {
+                    resource: "symspell".to_string(),
+                    file,
+                    downloaded: progress,
+                    total,
+                    status: "downloading".to_string(),
+                },
+                resources::DownloadStatus::Completed => ResourceDownloadProgress {
+                    resource: "symspell".to_string(),
+                    file: "".to_string(),
+                    downloaded: 0,
+                    total: 0,
+                    status: "completed".to_string(),
+                },
+                resources::DownloadStatus::Failed(err) => ResourceDownloadProgress {
+                    resource: "symspell".to_string(),
+                    file: "".to_string(),
+                    downloaded: 0,
+                    total: 0,
+                    status: format!("failed: {}", err),
+                },
+            };
+            let _ = window_clone2.emit("resource-download-progress", progress);
+        });
+
+        if let Err(e) = result {
+            eprintln!("Failed to download SymSpell dictionary: {}", e);
+            return Err(e);
+        }
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![scan_library, get_epub_path, get_book_text, analyze_book, export_json, cancel_analysis, get_active_jobs])
+        .invoke_handler(tauri::generate_handler![
+            scan_library,
+            get_epub_path,
+            get_book_text,
+            analyze_book,
+            export_json,
+            cancel_analysis,
+            get_active_jobs,
+            get_resource_status,
+            download_resources
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

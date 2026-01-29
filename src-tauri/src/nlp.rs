@@ -1,3 +1,4 @@
+use crate::resources;
 use gliner::model::{GLiNER, input::text::TextInput, pipeline::span::SpanMode};
 use orp::params::RuntimeParameters;
 
@@ -6,9 +7,6 @@ use ort::execution_providers::CoreMLExecutionProvider;
 use rust_stemmers::{Algorithm, Stemmer};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use symspell::{AsciiStringStrategy, SymSpell};
@@ -48,9 +46,6 @@ pub struct AnalysisStats {
 
 static GLINER_MODEL: OnceLock<Option<GLiNER<SpanMode>>> = OnceLock::new();
 static SYMSPELL: OnceLock<Option<SymSpell<AsciiStringStrategy>>> = OnceLock::new();
-
-const SYMSPELL_DICT_URL: &str = "https://raw.githubusercontent.com/wolfgarbe/SymSpell/master/SymSpell/frequency_dictionary_en_82_765.txt";
-const SYMSPELL_DICT_FILENAME: &str = "frequency_dictionary_en_82_765.txt";
 
 pub struct NlpPipeline {
     wordfreq: WordFreq,
@@ -138,25 +133,22 @@ impl NlpPipeline {
     }
 
     pub fn is_gliner_available() -> bool {
-        let model_dir = get_gliner_model_dir();
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        let model_path = model_dir.join("model.onnx");
-        tokenizer_path.exists() && model_path.exists()
+        resources::is_gliner_available()
     }
 
     fn get_gliner(&self) -> Option<&GLiNER<SpanMode>> {
         GLINER_MODEL.get_or_init(|| {
-            let model_dir = get_gliner_model_dir();
+            let model_dir = resources::get_gliner_dir();
             let tokenizer_path = model_dir.join("tokenizer.json");
             let model_path = model_dir.join("model.onnx");
 
             if !tokenizer_path.exists() || !model_path.exists() {
                 eprintln!("GLiNER model not found at {:?}", model_dir);
+                eprintln!("Run resource download to fetch the model automatically");
                 return None;
             }
 
             // Configure runtime with CoreML on macOS for better performance
-            // Use more threads for better parallelism
             #[cfg(target_os = "macos")]
             let runtime_params = RuntimeParameters::default()
                 .with_threads(8)
@@ -172,7 +164,7 @@ impl NlpPipeline {
                 model_path,
             ) {
                 Ok(model) => {
-                    eprintln!("GLiNER model loaded successfully (CoreML enabled on macOS)");
+                    eprintln!("GLiNER model loaded successfully");
                     Some(model)
                 }
                 Err(e) => {
@@ -654,7 +646,6 @@ impl NlpPipeline {
         check_cancel!();
 
         let total_candidates = candidates.len();
-        eprintln!("Found {} hard word candidates after wordfreq filtering", total_candidates);
 
         on_progress(AnalysisProgress {
             stage: "Filtering names & places".to_string(),
@@ -663,38 +654,99 @@ impl NlpPipeline {
             sample_words: None,
         });
 
-        // NER filtering (simplified for cancellation support)
+        // NER filtering with progress updates
         let proper_noun_candidates: Vec<&(String, usize, Vec<String>, bool, HashSet<String>)> =
             candidates.iter().filter(|(_, _, _, needs_ner, _)| *needs_ner).collect();
 
+        // Collect all candidate words that need NER checking (for display)
+        let candidate_words: Vec<String> = proper_noun_candidates
+            .iter()
+            .flat_map(|(_, _, _, _, forms)| forms.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
         check_cancel!();
 
-        let named_entities = if !proper_noun_candidates.is_empty() && Self::is_gliner_available() {
+        // HARD FAIL: Resources must be available before analysis
+        // Check SymSpell (required for malformed word detection)
+        if !resources::is_symspell_available() {
+            eprintln!("ERROR: SymSpell dictionary required but not available. Download resources first.");
+            return None;
+        }
+
+        // If there are proper noun candidates, we MUST have GLiNER available
+        // Fail hard if model is missing - don't silently skip NER
+        if !proper_noun_candidates.is_empty() && !Self::is_gliner_available() {
+            eprintln!("ERROR: GLiNER model required but not available. Download resources first.");
+            return None;
+        }
+
+        let named_entities = if !proper_noun_candidates.is_empty() {
             let sentences_to_check: Vec<&str> = proper_noun_candidates
                 .iter()
                 .flat_map(|(_, _, contexts, _, _)| contexts.iter().map(|s| s.as_str()))
+                .collect::<HashSet<_>>()
+                .into_iter()
                 .collect();
 
-            // Simplified NER with cancellation checks
+            let _total_ner_sentences = sentences_to_check.len();
+
+            // Show candidate words before loading model
+            let all_candidates: Vec<SampleWord> = candidate_words
+                .iter()
+                .map(|w| SampleWord {
+                    word: w.clone(),
+                    is_entity: false, // Not yet classified
+                })
+                .collect();
+
+            on_progress(AnalysisProgress {
+                stage: "Loading NER model".to_string(),
+                progress: 42,
+                detail: Some(format!("{} words to check", candidate_words.len())),
+                sample_words: Some(all_candidates.clone()),
+            });
+
             let mut entities = HashSet::new();
             if let Some(gliner) = self.get_gliner() {
+                // Emit progress to confirm model is loaded
+                on_progress(AnalysisProgress {
+                    stage: "Filtering names & places".to_string(),
+                    progress: 44,
+                    detail: Some("NER model ready, processing...".to_string()),
+                    sample_words: Some(all_candidates),
+                });
+
                 let chunks: Vec<&str> = sentences_to_check.iter()
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty() && s.len() < 512)
                     .collect();
 
-                let batch_size = 16;
+                let total_chunks = chunks.len();
+                let batch_size = 8;
+                let mut processed = 0;
+
                 for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
-                    if batch_idx % 5 == 0 {
-                        check_cancel!();
-                    }
+                    check_cancel!();
+
+                    let pre_progress = 45 + (processed * 35 / total_chunks.max(1)) as u8;
+                    on_progress(AnalysisProgress {
+                        stage: "Filtering names & places".to_string(),
+                        progress: pre_progress.min(79),
+                        detail: Some(format!("Processing batch {}/{}...", batch_idx + 1, (total_chunks + batch_size - 1) / batch_size)),
+                        sample_words: None,
+                    });
 
                     let input = match TextInput::from_str(
                         batch,
                         &["person", "location", "organization", "country", "city"],
                     ) {
                         Ok(input) => input,
-                        Err(_) => continue,
+                        Err(_) => {
+                            processed += batch.len();
+                            continue;
+                        }
                     };
 
                     if let Ok(output) = gliner.inference(input) {
@@ -708,10 +760,38 @@ impl NlpPipeline {
                             }
                         }
                     }
+
+                    processed += batch.len();
+
+                    // Update progress (45% to 80% during NER inference)
+                    let ner_progress = 45 + (processed * 35 / total_chunks.max(1)) as u8;
+
+                    // Show current classification state of ALL candidate words
+                    let word_states: Vec<SampleWord> = candidate_words
+                        .iter()
+                        .map(|w| SampleWord {
+                            word: w.clone(),
+                            is_entity: entities.contains(w),
+                        })
+                        .collect();
+
+                    on_progress(AnalysisProgress {
+                        stage: "Filtering names & places".to_string(),
+                        progress: ner_progress.min(80),
+                        detail: Some(format!("{}/{} sentences, {} names found", processed, total_chunks, entities.len())),
+                        sample_words: Some(word_states),
+                    });
                 }
             }
             entities
         } else {
+            // No proper noun candidates to check - skip NER entirely
+            on_progress(AnalysisProgress {
+                stage: "Filtering names & places".to_string(),
+                progress: 80,
+                detail: Some("No proper noun candidates".to_string()),
+                sample_words: None,
+            });
             HashSet::new()
         };
 
@@ -799,97 +879,12 @@ impl NlpPipeline {
     }
 }
 
-fn get_gliner_model_dir() -> PathBuf {
-    // Check for bundled resources first
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let bundled = exe_dir.join("resources").join("gliner");
-            if bundled.exists() {
-                return bundled;
-            }
-            // macOS app bundle
-            let macos_bundled = exe_dir.join("../Resources/gliner");
-            if macos_bundled.exists() {
-                return macos_bundled;
-            }
-        }
-    }
-
-    // Development path
-    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources").join("gliner");
-    if dev_path.exists() {
-        return dev_path;
-    }
-
-    // User data directory fallback
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("lexis")
-        .join("models")
-        .join("gliner")
-}
-
-fn get_symspell_dict_path() -> PathBuf {
-    // Check for bundled resources first
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let bundled = exe_dir.join("resources").join("symspell").join(SYMSPELL_DICT_FILENAME);
-            if bundled.exists() {
-                return bundled;
-            }
-            // macOS app bundle
-            let macos_bundled = exe_dir.join("../Resources/symspell").join(SYMSPELL_DICT_FILENAME);
-            if macos_bundled.exists() {
-                return macos_bundled;
-            }
-        }
-    }
-
-    // Development path
-    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
-        .join("symspell")
-        .join(SYMSPELL_DICT_FILENAME);
-    dev_path
-}
-
-fn download_symspell_dict() -> Result<PathBuf, String> {
-    let dict_path = get_symspell_dict_path();
-
-    if dict_path.exists() {
-        return Ok(dict_path);
-    }
-
-    eprintln!("SymSpell dictionary not found, downloading...");
-
-    // Create directory if needed
-    if let Some(parent) = dict_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-
-    // Download the dictionary
-    let response = ureq::get(SYMSPELL_DICT_URL)
-        .call()
-        .map_err(|e| format!("Failed to download dictionary: {}", e))?;
-
-    let mut content = Vec::new();
-    response.into_reader()
-        .read_to_end(&mut content)
-        .map_err(|e| format!("Failed to read response: {}", e))?;
-
-    // Write to file
-    let mut file = fs::File::create(&dict_path)
-        .map_err(|e| format!("Failed to create dictionary file: {}", e))?;
-    file.write_all(&content)
-        .map_err(|e| format!("Failed to write dictionary: {}", e))?;
-
-    eprintln!("SymSpell dictionary downloaded to {:?}", dict_path);
-    Ok(dict_path)
-}
-
 fn get_symspell() -> Option<&'static SymSpell<AsciiStringStrategy>> {
     SYMSPELL.get_or_init(|| {
-        let dict_path = match download_symspell_dict() {
+        // Use the resource system to ensure dictionary is available
+        let dict_path = match resources::ensure_symspell_dict(|_status| {
+            // Silent download for symspell (it's small)
+        }) {
             Ok(path) => path,
             Err(e) => {
                 eprintln!("Failed to get SymSpell dictionary: {}", e);
@@ -899,7 +894,6 @@ fn get_symspell() -> Option<&'static SymSpell<AsciiStringStrategy>> {
 
         let mut symspell: SymSpell<AsciiStringStrategy> = SymSpell::default();
 
-        // Load the dictionary (term_index=0, count_index=1, separator=" ")
         let loaded = symspell.load_dictionary(
             dict_path.to_str().unwrap_or(""),
             0,
