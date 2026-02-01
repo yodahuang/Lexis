@@ -154,8 +154,14 @@ impl NlpPipeline {
                 .with_threads(8)
                 .with_execution_providers([CoreMLExecutionProvider::default().build()]);
 
+            #[cfg(target_os = "macos")]
+            eprintln!("GLiNER runtime: CoreML execution provider configured");
+
             #[cfg(not(target_os = "macos"))]
             let runtime_params = RuntimeParameters::default().with_threads(8);
+
+            #[cfg(not(target_os = "macos"))]
+            eprintln!("GLiNER runtime: default CPU execution provider configured");
 
             match GLiNER::<SpanMode>::new(
                 Default::default(),
@@ -210,10 +216,11 @@ impl NlpPipeline {
         eprintln!("Running GLiNER on {} sentences...", total_sentences);
 
         // Process in smaller batches for better CoreML utilization
-        let batch_size = 16;
+        let batch_size = 64;
         let mut processed = 0;
 
-        for batch in chunks.chunks(batch_size) {
+        let mut total_infer_ms: u128 = 0;
+        for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
             let input = match TextInput::from_str(
                 batch,
                 &["person", "location", "organization", "country", "city"],
@@ -229,6 +236,7 @@ impl NlpPipeline {
             // Clear recent for this batch
             recent_entities.clear();
 
+            let infer_start = std::time::Instant::now();
             match gliner.inference(input) {
                 Ok(output) => {
                     for spans in output.spans.iter() {
@@ -251,10 +259,30 @@ impl NlpPipeline {
                     eprintln!("GLiNER inference error: {}", e);
                 }
             }
+            let infer_elapsed = infer_start.elapsed();
+            total_infer_ms += infer_elapsed.as_millis();
+            if batch_idx == 0 {
+                eprintln!(
+                    "GLiNER first batch inference: {} ms for {} sentences (batch size {})",
+                    infer_elapsed.as_millis(),
+                    batch.len(),
+                    batch_size
+                );
+            }
 
             processed += batch.len();
             // Report progress after processing each batch with recent entities
             on_progress(processed, total_sentences, entities.len(), &recent_entities);
+        }
+
+        if total_sentences > 0 {
+            let avg_ms = total_infer_ms as f64 / total_sentences as f64;
+            eprintln!(
+                "GLiNER total inference time: {} ms for {} sentences (avg {:.2} ms/sentence)",
+                total_infer_ms,
+                total_sentences,
+                avg_ms
+            );
         }
 
         eprintln!("GLiNER found {} unique entities", entities.len());
@@ -284,7 +312,7 @@ impl NlpPipeline {
         // FIRST PASS: Collect word counts and identify hard word CANDIDATES using wordfreq
         // This is fast and filters out most words before we even touch GLiNER
         // Key is stemmed form, value is (count, contexts, is_proper_noun_candidate, original_forms)
-        let mut word_data: HashMap<String, (usize, Vec<String>, bool, HashSet<String>)> = HashMap::new();
+        let mut word_data: HashMap<String, (usize, Vec<String>, bool, HashSet<String>, HashSet<String>)> = HashMap::new();
 
         for sentence in &sentences {
             let words: Vec<&str> = sentence.unicode_words().collect();
@@ -308,7 +336,7 @@ impl NlpPipeline {
                 // Check if likely proper noun (will need NER verification)
                 let is_proper = is_likely_proper_noun(word, sentence);
 
-                let entry = word_data.entry(stemmed).or_insert((0, Vec::new(), false, HashSet::new()));
+                let entry = word_data.entry(stemmed).or_insert((0, Vec::new(), false, HashSet::new(), HashSet::new()));
                 entry.0 += 1;
                 if is_proper {
                     entry.2 = true; // Mark as needing NER check
@@ -321,15 +349,18 @@ impl NlpPipeline {
                     if !entry.1.contains(&context) {
                         entry.1.push(context);
                     }
+                    if is_proper {
+                        entry.4.insert(context);
+                    }
                 }
             }
         }
 
         // Filter to get hard word candidates based on frequency
         // Use stemmed form for frequency lookup, but try original forms too
-        let candidates: Vec<(String, usize, Vec<String>, bool, HashSet<String>)> = word_data
+        let candidates: Vec<(String, usize, Vec<String>, bool, HashSet<String>, HashSet<String>)> = word_data
             .into_iter()
-            .filter_map(|(stemmed, (count, contexts, needs_ner, original_forms))| {
+            .filter_map(|(stemmed, (count, contexts, needs_ner, original_forms, ner_contexts))| {
                 // Filter out malformed words (EPUB parsing errors like "believethat's")
                 for form in &original_forms {
                     if self.is_malformed_word(form) {
@@ -354,7 +385,7 @@ impl NlpPipeline {
                     return None;
                 }
 
-                Some((stemmed, count, contexts, needs_ner, original_forms))
+                Some((stemmed, count, contexts, needs_ner, original_forms, ner_contexts))
             })
             .collect();
 
@@ -364,9 +395,9 @@ impl NlpPipeline {
         // This is MUCH faster than running on the entire book
         let sentences_needing_ner: Vec<&str> = candidates
             .iter()
-            .filter(|(_, _, _, needs_ner, _)| *needs_ner)
-            .flat_map(|(_, _, contexts, _, _)| {
-                contexts.iter().map(|c| c.trim_end_matches('.'))
+            .filter(|(_, _, _, needs_ner, _, _)| *needs_ner)
+            .flat_map(|(_, _, _, _, _, ner_contexts)| {
+                ner_contexts.iter().map(|c| c.trim_end_matches('.'))
             })
             .collect::<HashSet<_>>()
             .into_iter()
@@ -380,7 +411,7 @@ impl NlpPipeline {
             // Get sample rare words (sorted by frequency, rarest first) to show in progress
             let rare_word_samples: Vec<String> = {
                 let mut sorted_candidates: Vec<_> = candidates.iter()
-                    .map(|(_, _, _, _, forms)| {
+                    .map(|(_, _, _, _, forms, _)| {
                         let form = forms.iter().next().cloned().unwrap_or_default();
                         let freq = self.wordfreq.word_frequency(&form);
                         (form, freq)
@@ -453,7 +484,7 @@ impl NlpPipeline {
         // Final filtering and scoring
         let mut scored_words: Vec<HardWord> = candidates
             .into_iter()
-            .filter_map(|(stemmed, count, contexts, needs_ner, original_forms)| {
+            .filter_map(|(stemmed, count, contexts, needs_ner, original_forms, _)| {
                 // If it was flagged as needing NER and any form is a named entity, skip it
                 if needs_ner {
                     if named_entities.contains(&stemmed) {
@@ -582,7 +613,7 @@ impl NlpPipeline {
 
         eprintln!("Processing {} sentences...", sentences.len());
 
-        let mut word_data: HashMap<String, (usize, Vec<String>, bool, HashSet<String>)> = HashMap::new();
+        let mut word_data: HashMap<String, (usize, Vec<String>, bool, HashSet<String>, HashSet<String>)> = HashMap::new();
 
         for (i, sentence) in sentences.iter().enumerate() {
             // Check cancellation every 100 sentences
@@ -600,25 +631,29 @@ impl NlpPipeline {
                 let is_proper = is_likely_proper_noun(word, sentence);
 
                 let entry = word_data.entry(stemmed.clone()).or_insert_with(|| {
-                    (0, Vec::new(), false, HashSet::new())
+                    (0, Vec::new(), false, HashSet::new(), HashSet::new())
                 });
                 entry.0 += 1;
-                if entry.1.len() < 10 {
-                    entry.1.push(sentence.to_string());
-                }
                 if is_proper {
                     entry.2 = true;
                 }
                 entry.3.insert(lower);
+                let context = sentence.to_string();
+                if entry.1.len() < 10 {
+                    entry.1.push(context.clone());
+                }
+                if is_proper {
+                    entry.4.insert(context);
+                }
             }
         }
 
         check_cancel!();
 
         // Filter candidates using wordfreq
-        let candidates: Vec<(String, usize, Vec<String>, bool, HashSet<String>)> = word_data
+        let candidates: Vec<(String, usize, Vec<String>, bool, HashSet<String>, HashSet<String>)> = word_data
             .into_iter()
-            .filter_map(|(stemmed, (count, contexts, needs_ner, original_forms))| {
+            .filter_map(|(stemmed, (count, contexts, needs_ner, original_forms, ner_contexts))| {
                 for form in &original_forms {
                     if self.is_malformed_word(form) {
                         return None;
@@ -639,7 +674,7 @@ impl NlpPipeline {
                     return None;
                 }
 
-                Some((stemmed, count, contexts, needs_ner, original_forms))
+                Some((stemmed, count, contexts, needs_ner, original_forms, ner_contexts))
             })
             .collect();
 
@@ -655,13 +690,13 @@ impl NlpPipeline {
         });
 
         // NER filtering with progress updates
-        let proper_noun_candidates: Vec<&(String, usize, Vec<String>, bool, HashSet<String>)> =
-            candidates.iter().filter(|(_, _, _, needs_ner, _)| *needs_ner).collect();
+        let proper_noun_candidates: Vec<&(String, usize, Vec<String>, bool, HashSet<String>, HashSet<String>)> =
+            candidates.iter().filter(|(_, _, _, needs_ner, _, _)| *needs_ner).collect();
 
         // Collect all candidate words that need NER checking (for display)
         let candidate_words: Vec<String> = proper_noun_candidates
             .iter()
-            .flat_map(|(_, _, _, _, forms)| forms.iter().cloned())
+            .flat_map(|(_, _, _, _, forms, _)| forms.iter().cloned())
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
@@ -685,7 +720,7 @@ impl NlpPipeline {
         let named_entities = if !proper_noun_candidates.is_empty() {
             let sentences_to_check: Vec<&str> = proper_noun_candidates
                 .iter()
-                .flat_map(|(_, _, contexts, _, _)| contexts.iter().map(|s| s.as_str()))
+                .flat_map(|(_, _, _, _, _, ner_contexts)| ner_contexts.iter().map(|s| s.as_str()))
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
@@ -724,8 +759,9 @@ impl NlpPipeline {
                     .collect();
 
                 let total_chunks = chunks.len();
-                let batch_size = 8;
+                let batch_size = 64;
                 let mut processed = 0;
+                let mut total_infer_ms: u128 = 0;
 
                 for (batch_idx, batch) in chunks.chunks(batch_size).enumerate() {
                     check_cancel!();
@@ -749,6 +785,7 @@ impl NlpPipeline {
                         }
                     };
 
+                    let infer_start = std::time::Instant::now();
                     if let Ok(output) = gliner.inference(input) {
                         for spans in output.spans.iter() {
                             for span in spans.iter() {
@@ -759,6 +796,16 @@ impl NlpPipeline {
                                 }
                             }
                         }
+                    }
+                    let infer_elapsed = infer_start.elapsed();
+                    total_infer_ms += infer_elapsed.as_millis();
+                    if batch_idx == 0 {
+                        eprintln!(
+                            "GLiNER first batch inference: {} ms for {} sentences (batch size {})",
+                            infer_elapsed.as_millis(),
+                            batch.len(),
+                            batch_size
+                        );
                     }
 
                     processed += batch.len();
@@ -782,6 +829,16 @@ impl NlpPipeline {
                         sample_words: Some(word_states),
                     });
                 }
+
+                if total_chunks > 0 {
+                    let avg_ms = total_infer_ms as f64 / total_chunks as f64;
+                    eprintln!(
+                        "GLiNER total inference time: {} ms for {} sentences (avg {:.2} ms/sentence)",
+                        total_infer_ms,
+                        total_chunks,
+                        avg_ms
+                    );
+                }
             }
             entities
         } else {
@@ -801,7 +858,7 @@ impl NlpPipeline {
 
         let mut scored_words: Vec<HardWord> = candidates
             .into_iter()
-            .filter_map(|(stemmed, count, contexts, needs_ner, original_forms)| {
+            .filter_map(|(stemmed, count, contexts, needs_ner, original_forms, _)| {
                 if needs_ner {
                     if named_entities.contains(&stemmed) {
                         filtered_by_ner.push(stemmed.clone());
