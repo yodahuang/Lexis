@@ -28,3 +28,7 @@ node_modules
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Generated Tauri icons (regenerate with: bun run icons)
+src-tauri/icons/*
+!src-tauri/icons/icon-source.png

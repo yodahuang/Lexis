@@ -4,8 +4,9 @@
   "description": "",
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "icons": "tauri icon src-tauri/icons/icon-source.png",
+    "dev": "bun run icons && tauri dev",
+    "build": "bun run icons && tauri build",
     "dev:frontend": "vite dev",
     "build:frontend": "vite build",
     "preview": "vite preview",
