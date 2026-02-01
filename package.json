@@ -4,15 +4,15 @@
   "description": "",
   "type": "module",
   "scripts": {
-    "icons": "tauri icon src-tauri/icons/icon-source.png",
-    "dev": "bun run icons && tauri dev",
-    "build": "bun run icons && tauri build",
+    "icons": "bunx @tauri-apps/cli icon src-tauri/icons/icon-source.png",
+    "dev": "bun run icons && bunx @tauri-apps/cli dev",
+    "build": "bun run icons && bunx @tauri-apps/cli build",
     "dev:frontend": "vite dev",
     "build:frontend": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
-    "tauri": "tauri"
+    "tauri": "bunx @tauri-apps/cli"
   },
   "license": "MIT",
   "dependencies": {

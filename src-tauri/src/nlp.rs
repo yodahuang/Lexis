@@ -347,7 +347,7 @@ impl NlpPipeline {
                 if sentence.len() > 20 && sentence.len() < 500 {
                     let context = format!("{}.", sentence);
                     if !entry.1.contains(&context) {
-                        entry.1.push(context);
+                        entry.1.push(context.clone());
                     }
                     if is_proper {
                         entry.4.insert(context);
