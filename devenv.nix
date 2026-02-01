@@ -3,7 +3,10 @@
 {
   packages = [
     pkgs.curl
+    pkgs.sccache
   ];
+
+  env.RUSTC_WRAPPER = "sccache";
 
   languages.rust.enable = true;
   languages.javascript = {
